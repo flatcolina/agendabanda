@@ -1,29 +1,24 @@
-# Railway Backend (FastAPI) — Eventos + Google Maps
+# Railway Backend (FastAPI) — Eventos + Bandas + Google Maps + Relatórios
 
-## Rodar local
-```bash
-cd railway-backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# edite .env e coloque GOOGLE_MAPS_API_KEY
-uvicorn main:app --reload --port 8000
-```
+## Variáveis (Railway)
+- `GOOGLE_MAPS_API_KEY` (obrigatório para rotas/distância)
+- (opcional) `FRONTEND_ORIGINS` (para travar CORS)
 
 ## Endpoints
-- `GET /health`
+### Bandas
+- `GET /api/bands`
+- `POST /api/bands`
+- `DELETE /api/bands/{band_id}`
+
+### Eventos
 - `POST /api/events`
 - `GET /api/events`
-- `GET /api/events/{id}`
 - `PUT /api/events/{id}`
 - `DELETE /api/events/{id}`
-- `GET /api/geocode?address=...`
-- `GET /api/distancia?origem=...&destino=...`
-- `GET /api/rota?origem=...&destino=...`
 
-## Railway
-- Suba a pasta `railway-backend` como serviço.
-- Variables:
-  - `GOOGLE_MAPS_API_KEY`
-  - (opcional) `FRONTEND_ORIGINS`
+### Relatórios
+- `GET /api/reports/itinerary?band=...&date=YYYY-MM-DD`
+- `GET /api/reports/pdf?band=&date=&city=`
+
+## Observação
+Se você já tinha banco antigo, o backend faz migração leve e mantém os dados.

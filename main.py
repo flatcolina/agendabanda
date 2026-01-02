@@ -6,53 +6,112 @@ from typing import List, Optional, Dict, Any
 from uuid import uuid4
 
 import requests
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+except Exception:
+    canvas = None  # reportlab optional (for PDF)
 
 APP_NAME = "Hospediou Events + Google Maps"
 DB_PATH = os.getenv("DB_PATH", "app.db")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 
+_db_lock = threading.Lock()
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-_db_lock = threading.Lock()
 
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table});")
+    cols = [r[1] for r in cur.fetchall()]
+    return column in cols
+
 def init_db() -> None:
     with _db_lock:
         conn = _get_conn()
         try:
+            # Bands
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bands (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    city TEXT,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
+            # Events
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY,
+                    band_id TEXT,
+                    band_name TEXT NOT NULL,
                     event_name TEXT NOT NULL,
                     contractor_name TEXT NOT NULL,
                     contact TEXT NOT NULL,
                     date TEXT NOT NULL,         -- YYYY-MM-DD
                     time TEXT NOT NULL,         -- HH:MM
                     address TEXT NOT NULL,      -- free text
+
                     city TEXT,
                     state TEXT,
                     postal_code TEXT,
                     notes TEXT,
                     status TEXT NOT NULL DEFAULT 'planned',
+
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
             )
             conn.commit()
+
+            # Migrations for older DBs
+            if not _table_has_column(conn, "events", "band_id"):
+                conn.execute("ALTER TABLE events ADD COLUMN band_id TEXT;")
+                conn.commit()
+            if not _table_has_column(conn, "events", "band_name"):
+                conn.execute("ALTER TABLE events ADD COLUMN band_name TEXT;")
+                conn.commit()
         finally:
             conn.close()
 
+# ----------------- Models -----------------
+
+class BandBase(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    city: Optional[str] = Field(default=None, max_length=80)
+    notes: Optional[str] = Field(default=None, max_length=1000)
+
+class BandCreate(BandBase):
+    pass
+
+class Band(BandBase):
+    id: str
+    created_at: str
+    updated_at: str
+
 class EventBase(BaseModel):
+    # band selection
+    band_id: Optional[str] = Field(default=None, description="ID da banda (se cadastrado)")
+    band_name: str = Field(..., min_length=2, max_length=120, description="Nome da banda/artista (texto)")
+
     event_name: str = Field(..., min_length=2, max_length=120)
     contractor_name: str = Field(..., min_length=2, max_length=120)
     contact: str = Field(..., min_length=2, max_length=120, description="Phone/WhatsApp/email")
@@ -60,7 +119,6 @@ class EventBase(BaseModel):
     time: str = Field(..., description="HH:MM")
     address: str = Field(..., min_length=5, max_length=240)
 
-    # extras úteis (opcionais)
     city: Optional[str] = Field(default=None, max_length=80)
     state: Optional[str] = Field(default=None, max_length=80)
     postal_code: Optional[str] = Field(default=None, max_length=30)
@@ -71,11 +129,14 @@ class EventCreate(EventBase):
     pass
 
 class EventUpdate(BaseModel):
+    band_id: Optional[str] = None
+    band_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
+
     event_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
     contractor_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
     contact: Optional[str] = Field(default=None, min_length=2, max_length=120)
-    date: Optional[str] = Field(default=None)
-    time: Optional[str] = Field(default=None)
+    date: Optional[str] = None
+    time: Optional[str] = None
     address: Optional[str] = Field(default=None, min_length=5, max_length=240)
 
     city: Optional[str] = Field(default=None, max_length=80)
@@ -89,15 +150,11 @@ class Event(EventBase):
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+app = FastAPI(title=APP_NAME, version="3.0.0")
 
-# CORS (Netlify -> Railway)
+# CORS
 origins_env = os.getenv("FRONTEND_ORIGINS", "").strip()
-if origins_env:
-    allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
-else:
-    # dev friendly; troque por seus domínios quando quiser "travar"
-    allow_origins = ["*"]
+allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()] if origins_env else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -113,12 +170,112 @@ def _startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": APP_NAME}
+    return {"ok": True, "app": APP_NAME, "version": "3.0.0"}
 
-# ---------- EVENTS CRUD ----------
+# ----------------- Helpers -----------------
 
-def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return dict(row)
+
+def _require_key():
+    if not GOOGLE_MAPS_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY não configurada no Railway (Variables).")
+
+def _distance_matrix_single(origem: str, destino: str, mode: str = "driving") -> Dict[str, Any]:
+    _require_key()
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    r = requests.get(
+        url,
+        params={
+            "origins": origem,
+            "destinations": destino,
+            "mode": mode,
+            "language": "pt-BR",
+            "region": "br",
+            "key": GOOGLE_MAPS_API_KEY,
+        },
+        timeout=20,
+    )
+    data = r.json()
+    if data.get("status") != "OK":
+        return {"ok": False, "status": data.get("status"), "raw": data}
+    rows = data.get("rows") or []
+    if not rows or not rows[0].get("elements"):
+        return {"ok": False, "status": "NO_ELEMENTS", "raw": data}
+    el = rows[0]["elements"][0]
+    if el.get("status") != "OK":
+        return {"ok": False, "status": el.get("status"), "raw": data}
+    return {
+        "ok": True,
+        "origem": data.get("origin_addresses", [origem])[0],
+        "destino": data.get("destination_addresses", [destino])[0],
+        "distance_text": el["distance"]["text"],
+        "distance_meters": el["distance"]["value"],
+        "duration_text": el["duration"]["text"],
+        "duration_seconds": el["duration"]["value"],
+        "mode": mode,
+    }
+
+def _resolve_band_name(conn: sqlite3.Connection, band_id: Optional[str], band_name_fallback: str) -> str:
+    if not band_id:
+        return band_name_fallback
+    row = conn.execute("SELECT name FROM bands WHERE id = ?", (band_id,)).fetchone()
+    return (row["name"] if row and row.get("name") else band_name_fallback)
+
+# ----------------- Bands CRUD -----------------
+
+@app.get("/api/bands", response_model=List[Band])
+def list_bands(limit: int = Query(default=500, ge=1, le=5000)):
+    with _db_lock:
+        conn = _get_conn()
+        try:
+            rows = conn.execute("SELECT * FROM bands ORDER BY LOWER(name) ASC LIMIT ?", (limit,)).fetchall()
+        finally:
+            conn.close()
+    return [_row_to_dict(r) for r in rows]
+
+@app.post("/api/bands", response_model=Band)
+def create_band(payload: BandCreate):
+    band_id = str(uuid4())
+    now = _now_iso()
+    name = payload.name.strip()
+
+    with _db_lock:
+        conn = _get_conn()
+        try:
+            # enforce unique (case-insensitive) in app layer too
+            exists = conn.execute("SELECT id FROM bands WHERE LOWER(name)=LOWER(?)", (name,)).fetchone()
+            if exists:
+                raise HTTPException(status_code=400, detail="Banda já cadastrada.")
+            conn.execute(
+                """
+                INSERT INTO bands (id, name, city, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (band_id, name, payload.city, payload.notes, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return {"id": band_id, "name": name, "city": payload.city, "notes": payload.notes, "created_at": now, "updated_at": now}
+
+@app.delete("/api/bands/{band_id}")
+def delete_band(band_id: str):
+    with _db_lock:
+        conn = _get_conn()
+        try:
+            # keep events intact; only detach band_id
+            conn.execute("UPDATE events SET band_id = NULL WHERE band_id = ?", (band_id,))
+            cur = conn.execute("DELETE FROM bands WHERE id = ?", (band_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Banda não encontrada.")
+    return {"ok": True}
+
+# ----------------- Events CRUD -----------------
 
 @app.post("/api/events", response_model=Event)
 def create_event(payload: EventCreate):
@@ -128,15 +285,18 @@ def create_event(payload: EventCreate):
     with _db_lock:
         conn = _get_conn()
         try:
+            band_name = _resolve_band_name(conn, payload.band_id, payload.band_name).strip()
             conn.execute(
                 """
                 INSERT INTO events (
-                    id, event_name, contractor_name, contact, date, time, address,
+                    id, band_id, band_name, event_name, contractor_name, contact, date, time, address,
                     city, state, postal_code, notes, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
+                    payload.band_id,
+                    band_name,
                     payload.event_name,
                     payload.contractor_name,
                     payload.contact,
@@ -156,39 +316,34 @@ def create_event(payload: EventCreate):
         finally:
             conn.close()
 
-    return {
-        "id": event_id,
-        "created_at": now,
-        "updated_at": now,
-        **payload.model_dump(),
-    }
+    data = payload.model_dump()
+    data["band_name"] = band_name
+    return {"id": event_id, "created_at": now, "updated_at": now, **data}
 
 @app.get("/api/events", response_model=List[Event])
-def list_events(limit: int = Query(default=100, ge=1, le=500)):
+def list_events(limit: int = Query(default=2000, ge=1, le=5000)):
     with _db_lock:
         conn = _get_conn()
         try:
-            cur = conn.execute(
+            rows = conn.execute(
                 "SELECT * FROM events ORDER BY date ASC, time ASC, created_at DESC LIMIT ?",
                 (limit,),
-            )
-            rows = cur.fetchall()
+            ).fetchall()
         finally:
             conn.close()
-    return [_row_to_event(r) for r in rows]
+    return [_row_to_dict(r) for r in rows]
 
 @app.get("/api/events/{event_id}", response_model=Event)
 def get_event(event_id: str):
     with _db_lock:
         conn = _get_conn()
         try:
-            cur = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,))
-            row = cur.fetchone()
+            row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         finally:
             conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
-    return _row_to_event(row)
+    return _row_to_dict(row)
 
 @app.put("/api/events/{event_id}", response_model=Event)
 def update_event(event_id: str, payload: EventUpdate):
@@ -197,29 +352,34 @@ def update_event(event_id: str, payload: EventUpdate):
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # build dynamic update query
-    set_parts = [f"{k} = ?" for k in data.keys()]
-    params = list(data.values())
-    set_parts.append("updated_at = ?")
-    params.append(now)
-    params.append(event_id)
-
     with _db_lock:
         conn = _get_conn()
         try:
-            cur = conn.execute(
-                f"UPDATE events SET {', '.join(set_parts)} WHERE id = ?",
-                tuple(params),
-            )
+            if "band_id" in data or "band_name" in data:
+                bid = data.get("band_id")
+                bname = data.get("band_name")
+                # if band_id changed, resolve official name; else keep provided
+                if "band_id" in data:
+                    resolved = _resolve_band_name(conn, bid, bname or "")
+                    data["band_name"] = resolved.strip() if resolved else (bname or "")
+                elif "band_name" in data:
+                    data["band_name"] = data["band_name"].strip()
+
+            set_parts = [f"{k} = ?" for k in data.keys()]
+            params = list(data.values())
+            set_parts.append("updated_at = ?")
+            params.append(now)
+            params.append(event_id)
+
+            cur = conn.execute(f"UPDATE events SET {', '.join(set_parts)} WHERE id = ?", tuple(params))
             conn.commit()
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Event not found")
-            cur2 = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,))
-            row = cur2.fetchone()
+            row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         finally:
             conn.close()
 
-    return _row_to_event(row)
+    return _row_to_dict(row)
 
 @app.delete("/api/events/{event_id}")
 def delete_event(event_id: str):
@@ -234,14 +394,7 @@ def delete_event(event_id: str):
         raise HTTPException(status_code=404, detail="Event not found")
     return {"ok": True}
 
-# ---------- GOOGLE MAPS HELPERS ----------
-
-def _require_key():
-    if not GOOGLE_MAPS_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="GOOGLE_MAPS_API_KEY não configurada no Railway (Variables).",
-        )
+# ----------------- Google Maps -----------------
 
 @app.get("/api/geocode")
 def geocode(address: str = Query(..., min_length=5)):
@@ -269,91 +422,171 @@ def geocode(address: str = Query(..., min_length=5)):
 
 @app.get("/api/distancia")
 def distance_matrix(
-    origem: str = Query(..., min_length=3, description="Endereço texto (origem)"),
-    destino: str = Query(..., min_length=3, description="Endereço texto (destino)"),
-    mode: str = Query(default="driving", description="driving|walking|bicycling|transit"),
-    language: str = Query(default="pt-BR"),
-    region: str = Query(default="br"),
-):
-    _require_key()
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    try:
-        r = requests.get(
-            url,
-            params={
-                "origins": origem,
-                "destinations": destino,
-                "mode": mode,
-                "language": language,
-                "region": region,
-                "key": GOOGLE_MAPS_API_KEY,
-            },
-            timeout=20,
-        )
-        data = r.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao chamar Distance Matrix: {e}")
-
-    if data.get("status") != "OK":
-        return {"ok": False, "status": data.get("status"), "raw": data}
-
-    rows = data.get("rows") or []
-    if not rows or not rows[0].get("elements"):
-        return {"ok": False, "status": "NO_ELEMENTS", "raw": data}
-
-    el = rows[0]["elements"][0]
-    if el.get("status") != "OK":
-        return {"ok": False, "status": el.get("status"), "raw": data}
-
-    return {
-        "ok": True,
-        "origem": data.get("origin_addresses", [origem])[0],
-        "destino": data.get("destination_addresses", [destino])[0],
-        "distance_text": el["distance"]["text"],
-        "distance_meters": el["distance"]["value"],
-        "duration_text": el["duration"]["text"],
-        "duration_seconds": el["duration"]["value"],
-        "mode": mode,
-    }
-
-@app.get("/api/rota")
-def directions(
     origem: str = Query(..., min_length=3),
     destino: str = Query(..., min_length=3),
     mode: str = Query(default="driving"),
-    language: str = Query(default="pt-BR"),
-    region: str = Query(default="br"),
 ):
-    _require_key()
-    url = "https://maps.googleapis.com/maps/api/directions/json"
     try:
-        r = requests.get(
-            url,
-            params={
-                "origin": origem,
-                "destination": destino,
-                "mode": mode,
-                "language": language,
-                "region": region,
-                "key": GOOGLE_MAPS_API_KEY,
-            },
-            timeout=20,
-        )
-        data = r.json()
+        return _distance_matrix_single(origem, destino, mode=mode)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao chamar Directions: {e}")
+        raise HTTPException(status_code=502, detail=f"Erro ao chamar Distance Matrix: {e}")
 
-    if data.get("status") != "OK" or not data.get("routes"):
-        return {"ok": False, "status": data.get("status"), "raw": data}
+# ----------------- Reports -----------------
 
-    route = data["routes"][0]
-    leg = route["legs"][0] if route.get("legs") else {}
-    return {
-        "ok": True,
-        "origem": leg.get("start_address"),
-        "destino": leg.get("end_address"),
-        "distance_text": (leg.get("distance") or {}).get("text"),
-        "duration_text": (leg.get("duration") or {}).get("text"),
-        "polyline": (route.get("overview_polyline") or {}).get("points"),
-        "raw_status": data.get("status"),
-    }
+@app.get("/api/reports/events", response_model=List[Event])
+def report_events(
+    band: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
+    city: Optional[str] = Query(default=None),
+    limit: int = Query(default=5000, ge=1, le=10000),
+):
+    where = []
+    params: List[Any] = []
+    if band:
+        where.append("LOWER(band_name) = LOWER(?)")
+        params.append(band)
+    if date:
+        where.append("date = ?")
+        params.append(date)
+    if city:
+        where.append("LOWER(COALESCE(city,'')) = LOWER(?)")
+        params.append(city)
+
+    sql = "SELECT * FROM events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY date ASC, time ASC, created_at DESC LIMIT ?"
+    params.append(limit)
+
+    with _db_lock:
+        conn = _get_conn()
+        try:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        finally:
+            conn.close()
+
+    return [_row_to_dict(r) for r in rows]
+
+@app.get("/api/reports/itinerary")
+def report_itinerary(
+    band: str = Query(..., min_length=2),
+    date: str = Query(..., min_length=10),
+    mode: str = Query(default="driving"),
+):
+    with _db_lock:
+        conn = _get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE LOWER(band_name)=LOWER(?) AND date=? ORDER BY time ASC",
+                (band, date),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    events = [_row_to_dict(r) for r in rows]
+    legs: List[Dict[str, Any]] = []
+
+    if len(events) >= 2:
+        for i in range(len(events) - 1):
+            a = events[i]
+            b = events[i + 1]
+            try:
+                dist = _distance_matrix_single(a["address"], b["address"], mode=mode)
+            except HTTPException as he:
+                dist = {"ok": False, "status": "ERROR", "detail": he.detail}
+            legs.append(
+                {
+                    "from_event_id": a["id"],
+                    "to_event_id": b["id"],
+                    "from_time": a["time"],
+                    "to_time": b["time"],
+                    "from_address": a["address"],
+                    "to_address": b["address"],
+                    "distance": dist,
+                }
+            )
+
+    return {"ok": True, "band": band, "date": date, "events": events, "legs": legs}
+
+def _pdf_bytes(title: str, lines: List[str]) -> bytes:
+    if canvas is None:
+        raise HTTPException(status_code=500, detail="PDF não disponível (dependência reportlab ausente).")
+
+    import io
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    x = 18 * mm
+    y = height - 18 * mm
+
+    c.setTitle(title)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x, y, title)
+    y -= 10 * mm
+
+    c.setFont("Helvetica", 10)
+    for line in lines:
+        if y < 18 * mm:
+            c.showPage()
+            y = height - 18 * mm
+            c.setFont("Helvetica", 10)
+        c.drawString(x, y, line[:140])
+        y -= 6 * mm
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+@app.get("/api/reports/pdf")
+def report_pdf(
+    band: Optional[str] = Query(default=None),
+    date: Optional[str] = Query(default=None),
+    city: Optional[str] = Query(default=None),
+):
+    title = "Relatório de Eventos"
+    filters = []
+    if band:
+        filters.append(f"Banda: {band}")
+    if date:
+        filters.append(f"Data: {date}")
+    if city:
+        filters.append(f"Cidade: {city}")
+    if filters:
+        title += " (" + " | ".join(filters) + ")"
+
+    events = report_events(band=band, date=date, city=city, limit=10000)
+
+    lines: List[str] = []
+    lines.append("Filtros: " + (", ".join(filters) if filters else "nenhum"))
+    lines.append(" ")
+    lines.append("Eventos:")
+    if not events:
+        lines.append(" - (nenhum)")
+    else:
+        for ev in events:
+            lines.append(f" - {ev['date']} {ev['time']} | {ev['band_name']} | {ev['event_name']} | {ev.get('city') or '-'} | {ev['address']}")
+
+    if band and date:
+        it = report_itinerary(band=band, date=date)
+        lines.append(" ")
+        lines.append("Roteiro (do 1º show ao próximo):")
+        if not it["legs"]:
+            lines.append(" - (apenas 1 evento no dia)")
+        else:
+            for leg in it["legs"]:
+                d = leg["distance"]
+                if d.get("ok"):
+                    lines.append(f" - {leg['from_time']} -> {leg['to_time']} | {d['distance_text']} | {d['duration_text']}")
+                else:
+                    lines.append(f" - {leg['from_time']} -> {leg['to_time']} | (falha ao calcular)")
+
+    pdf = _pdf_bytes(title, lines)
+    filename = "relatorio_eventos.pdf"
+    return StreamingResponse(
+        iter([pdf]),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
