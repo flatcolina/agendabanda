@@ -7,7 +7,9 @@ from uuid import uuid4
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -171,11 +173,35 @@ class Event(EventBase):
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="3.7.0")
+app = FastAPI(title=APP_NAME, version="4.0.0")
 
-# CORS (modo teste / Netlify)
-# Forçamos CORS permissivo para evitar bloqueio no browser durante ajustes.
-# Depois que estiver 100%, você pode restringir (eu faço pra você).
+def _add_cors_headers(request: Request, response: Response):
+    origin = request.headers.get("origin")
+    response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
+    response.headers["Access-Control-Expose-Headers"] = "*"
+    return response
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exc_handler(request: Request, exc: RequestValidationError):
+    res = JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return _add_cors_headers(request, res)
+
+@app.exception_handler(HTTPException)
+async def _http_exc_handler(request: Request, exc: HTTPException):
+    res = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return _add_cors_headers(request, res)
+
+@app.exception_handler(Exception)
+async def _any_exc_handler(request: Request, exc: Exception):
+    res = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    return _add_cors_headers(request, res)
+
+
+# --- CORS (para Netlify) ---
+# Libera durante testes. Depois a gente trava só para o seu domínio.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -187,9 +213,9 @@ app.add_middleware(
     max_age=86400,
 )
 
-# Fallback extra: garante header mesmo em respostas de erro / 404.
 @app.middleware("http")
 async def _force_cors_headers(request: Request, call_next):
+    # Garante headers mesmo em respostas de erro
     response = await call_next(request)
     origin = request.headers.get("origin")
     response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
@@ -198,10 +224,25 @@ async def _force_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
     return response
 
-# Preflight handler (OPTIONS) para qualquer rota
 @app.options("/{full_path:path}")
 def _preflight(full_path: str, request: Request):
     return Response(status_code=200)
+
+@app.get("/debug/cors")
+def debug_cors(request: Request):
+    return {
+        "ok": True,
+        "origin": request.headers.get("origin"),
+        "note": "CORS habilitado (teste): Access-Control-Allow-Origin será ecoado quando houver Origin.",
+    }
+
+
+# CORS (modo teste / Netlify)
+# Forçamos CORS permissivo para evitar bloqueio no browser durante ajustes.
+# Depois que estiver 100%, você pode restringir (eu faço pra você).
+# Fallback extra: garante header mesmo em respostas de erro / 404.
+
+# Preflight handler (OPTIONS) para qualquer rota
 
 
 @app.on_event("startup")
