@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Any
 from uuid import uuid4
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -171,38 +171,37 @@ class Event(EventBase):
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="3.0.2")
+app = FastAPI(title=APP_NAME, version="3.6.0")
 
-# CORS
-# Por padrão (para facilitar testes com Netlify), liberamos qualquer origem.
-# Para travar depois, defina STRICT_CORS=1 e use FRONTEND_ORIGINS ou FRONTEND_ORIGIN_REGEX.
-STRICT_CORS = os.getenv("STRICT_CORS", "").strip().lower() in ("1", "true", "yes")
-
-origins_env = os.getenv("FRONTEND_ORIGINS", "").strip()
-regex_env = os.getenv("FRONTEND_ORIGIN_REGEX", "").strip()
-
-allow_origins = ["*"]
-allow_origin_regex = None
-
-if STRICT_CORS:
-    if regex_env:
-        allow_origins = []
-        allow_origin_regex = regex_env
-    elif origins_env:
-        allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
-        allow_origin_regex = None
-    else:
-        allow_origins = ["*"]
-        allow_origin_regex = None
-
+# CORS (modo teste / Netlify)
+# Forçamos CORS permissivo para evitar bloqueio no browser durante ajustes.
+# Depois que estiver 100%, você pode restringir (eu faço pra você).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_origin_regex=allow_origin_regex,
+    allow_origins=["*"],
+    allow_origin_regex=".*",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
+
+# Fallback extra: garante header mesmo em respostas de erro / 404.
+@app.middleware("http")
+async def _force_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
+    return response
+
+# Preflight handler (OPTIONS) para qualquer rota
+@app.options("/{full_path:path}")
+def _preflight(full_path: str, request: Request):
+    return Response(status_code=200)
 
 
 @app.on_event("startup")
