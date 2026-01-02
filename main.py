@@ -184,15 +184,26 @@ class Event(EventBase):
 app = FastAPI(title=APP_NAME, version="3.0.2")
 
 # CORS
-# Você pode travar por domínio no Railway usando:
-# FRONTEND_ORIGINS="https://seusite.netlify.app,https://outrodominio.com"
-# ou regex:
-# FRONTEND_ORIGIN_REGEX="^https://.*\.netlify\.app$"
-origins_env = os.getenv("FRONTEND_ORIGINS", "").strip()
-origin_regex = os.getenv("FRONTEND_ORIGIN_REGEX", "").strip()
+# Por padrão (para facilitar testes com Netlify), liberamos qualquer origem.
+# Para travar depois, defina STRICT_CORS=1 e use FRONTEND_ORIGINS ou FRONTEND_ORIGIN_REGEX.
+STRICT_CORS = os.getenv("STRICT_CORS", "").strip().lower() in ("1", "true", "yes")
 
-allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()] if origins_env else ["*"]
-allow_origin_regex = origin_regex or ".*"  # fallback: permite qualquer origem (bom pra testar)
+origins_env = os.getenv("FRONTEND_ORIGINS", "").strip()
+regex_env = os.getenv("FRONTEND_ORIGIN_REGEX", "").strip()
+
+allow_origins = ["*"]
+allow_origin_regex = None
+
+if STRICT_CORS:
+    if regex_env:
+        allow_origins = []
+        allow_origin_regex = regex_env
+    elif origins_env:
+        allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+        allow_origin_regex = None
+    else:
+        allow_origins = ["*"]
+        allow_origin_regex = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -201,7 +212,6 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
 )
 
 
