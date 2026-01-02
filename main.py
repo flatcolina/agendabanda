@@ -108,7 +108,7 @@ class Band(BandBase):
     updated_at: str
 
 class EventBase(BaseModel):
-    # band selection
+    # Selecione uma banda cadastrada (band_id) OU preencha o nome (band_name)
     band_id: Optional[str] = Field(default=None, description="ID da banda (se cadastrado)")
     band_name: Optional[str] = Field(default=None, min_length=2, max_length=120, description="Nome da banda/artista (texto)")
 
@@ -125,7 +125,6 @@ class EventBase(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=2000)
     status: str = Field(default="planned", max_length=30)
 
-    # ---- pydantic v2 validators ----
     @staticmethod
     def _empty_to_none(v: Optional[str]) -> Optional[str]:
         if v is None:
@@ -135,12 +134,9 @@ class EventBase(BaseModel):
         return v
 
     @classmethod
-    def model_validate(cls, obj, *args, **kwargs):  # keep base behavior
+    def model_validate(cls, obj, *args, **kwargs):
+        # Let pydantic do the heavy lifting, then normalize in post-init
         return super().model_validate(obj, *args, **kwargs)
-
-    @classmethod
-    def __get_pydantic_json_schema__(cls, core_schema, handler):
-        return handler(core_schema)
 
     def model_post_init(self, __context):
         # normalize empty strings
@@ -152,11 +148,10 @@ class EventBase(BaseModel):
         self.notes = self._empty_to_none(self.notes)
         self.status = (self.status or "planned").strip()
 
-        # validation: need at least one
         if not self.band_id and not self.band_name:
             raise ValueError("Informe a banda: selecione uma banda cadastrada ou preencha o nome da banda.")
 
-class EventCreate(EventBase):(EventBase):
+class EventCreate(EventBase):
     pass
 
 class EventUpdate(BaseModel):
