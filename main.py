@@ -9,7 +9,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
     from reportlab.lib.pagesizes import A4
@@ -110,7 +110,7 @@ class Band(BandBase):
 class EventBase(BaseModel):
     # Selecione uma banda cadastrada (band_id) OU preencha o nome (band_name)
     band_id: Optional[str] = Field(default=None, description="ID da banda (se cadastrado)")
-    band_name: Optional[str] = Field(default=None, min_length=2, max_length=120, description="Nome da banda/artista (texto)")
+    band_name: Optional[str] = Field(default=None, max_length=120, description="Nome da banda/artista (texto)")
 
     event_name: str = Field(..., min_length=2, max_length=120)
     contractor_name: str = Field(..., min_length=2, max_length=120)
@@ -125,31 +125,26 @@ class EventBase(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=2000)
     status: str = Field(default="planned", max_length=30)
 
-    @staticmethod
-    def _empty_to_none(v: Optional[str]) -> Optional[str]:
+    @field_validator("band_id", "band_name", "city", "state", "postal_code", "notes", "status", mode="before")
+    @classmethod
+    def _empty_to_none(cls, v):
         if v is None:
             return None
-        if isinstance(v, str) and not v.strip():
-            return None
+        if isinstance(v, str):
+            v2 = v.strip()
+            if v2 == "":
+                return None
+            return v2
         return v
 
-    @classmethod
-    def model_validate(cls, obj, *args, **kwargs):
-        # Let pydantic do the heavy lifting, then normalize in post-init
-        return super().model_validate(obj, *args, **kwargs)
-
-    def model_post_init(self, __context):
-        # normalize empty strings
-        self.band_id = self._empty_to_none(self.band_id)
-        self.band_name = self._empty_to_none(self.band_name)
-        self.city = self._empty_to_none(self.city)
-        self.state = self._empty_to_none(self.state)
-        self.postal_code = self._empty_to_none(self.postal_code)
-        self.notes = self._empty_to_none(self.notes)
-        self.status = (self.status or "planned").strip()
-
+    @model_validator(mode="after")
+    def _check_band(self):
         if not self.band_id and not self.band_name:
             raise ValueError("Informe a banda: selecione uma banda cadastrada ou preencha o nome da banda.")
+        # normalize status fallback
+        if not self.status:
+            self.status = "planned"
+        return self
 
 class EventCreate(EventBase):
     pass
