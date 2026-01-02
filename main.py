@@ -171,7 +171,7 @@ class Event(EventBase):
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="3.6.0")
+app = FastAPI(title=APP_NAME, version="3.7.0")
 
 # CORS (modo teste / Netlify)
 # Forçamos CORS permissivo para evitar bloqueio no browser durante ajustes.
