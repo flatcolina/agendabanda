@@ -181,19 +181,29 @@ class Event(EventBase):
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="3.0.0")
+app = FastAPI(title=APP_NAME, version="3.0.2")
 
 # CORS
+# Você pode travar por domínio no Railway usando:
+# FRONTEND_ORIGINS="https://seusite.netlify.app,https://outrodominio.com"
+# ou regex:
+# FRONTEND_ORIGIN_REGEX="^https://.*\.netlify\.app$"
 origins_env = os.getenv("FRONTEND_ORIGINS", "").strip()
+origin_regex = os.getenv("FRONTEND_ORIGIN_REGEX", "").strip()
+
 allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()] if origins_env else ["*"]
+allow_origin_regex = origin_regex or ".*"  # fallback: permite qualquer origem (bom pra testar)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
+
 
 @app.on_event("startup")
 def _startup():
@@ -201,7 +211,17 @@ def _startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "version": "3.0.0"}
+    return {"ok": True, "app": APP_NAME, "version": "3.0.2"}
+
+@app.get("/debug/cors")
+def debug_cors(origin: str | None = None):
+    # origin param é opcional; o navegador envia o header Origin automaticamente
+    return {
+        "allow_origins_env": os.getenv("FRONTEND_ORIGINS", ""),
+        "allow_origin_regex_env": os.getenv("FRONTEND_ORIGIN_REGEX", ""),
+        "note": "Use o DevTools/Network para ver Access-Control-Allow-Origin no response.",
+        "origin_param": origin,
+    }
 
 # ----------------- Helpers -----------------
 

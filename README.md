@@ -22,3 +22,8 @@
 
 ## Observação
 Se você já tinha banco antigo, o backend faz migração leve e mantém os dados.
+
+## CORS (importante)
+- Para travar: defina `FRONTEND_ORIGINS` com seu domínio do Netlify.
+- Ex: `https://whimsical-pixie-4997ea.netlify.app`
+- Ou use regex: `FRONTEND_ORIGIN_REGEX=^https://.*\.netlify\.app$`
