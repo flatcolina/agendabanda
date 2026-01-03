@@ -1,126 +1,115 @@
 import os
 import sqlite3
-import threading
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
-from uuid import uuid4
+import textwrap
+from datetime import datetime
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import mm
-except Exception:
-    canvas = None  # reportlab optional (for PDF)
+APP_NAME = "AgendaBanda"
+VERSION = "1.0.0"
 
-APP_NAME = "Hospediou Events + Google Maps"
-DB_PATH = os.getenv("DB_PATH", "/tmp/hospediou_events.db")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+DB_PATH = os.getenv("DB_PATH", "/tmp/agendabanda.db")
 
-_db_lock = threading.Lock()
+def utc_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
-    cur = conn.execute(f"PRAGMA table_info({table});")
-    cols = [r[1] for r in cur.fetchall()]
-    return column in cols
-
 def init_db() -> None:
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            # Bands
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bands (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    city TEXT,
-                    notes TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                """
-            )
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bands (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            city TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            band_id TEXT,
+            band_name TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            contractor_name TEXT NOT NULL,
+            contact TEXT NOT NULL,
+            date TEXT NOT NULL,
+            time TEXT NOT NULL,
+            address TEXT NOT NULL,
+            city TEXT,
+            state TEXT,
+            postal_code TEXT,
+            notes TEXT,
+            status TEXT NOT NULL,
+            lat REAL,
+            lng REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events(date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_band_date ON events(band_id, date)")
+    conn.commit()
+    conn.close()
 
-            # Events
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    id TEXT PRIMARY KEY,
-                    band_id TEXT,
-                    band_name TEXT NOT NULL,
-                    event_name TEXT NOT NULL,
-                    contractor_name TEXT NOT NULL,
-                    contact TEXT NOT NULL,
-                    date TEXT NOT NULL,         -- YYYY-MM-DD
-                    time TEXT NOT NULL,         -- HH:MM
-                    address TEXT NOT NULL,      -- free text
+def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    if not d.get("status"):
+        d["status"] = "planned"
+    if not d.get("created_at"):
+        d["created_at"] = utc_now()
+    if not d.get("updated_at"):
+        d["updated_at"] = d["created_at"]
+    if not d.get("band_name"):
+        d["band_name"] = "Banda"
+    return d
 
-                    city TEXT,
-                    state TEXT,
-                    postal_code TEXT,
-                    notes TEXT,
-                    status TEXT NOT NULL DEFAULT 'planned',
-
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                """
-            )
-            conn.commit()
-
-            # Migrations for older DBs
-            if not _table_has_column(conn, "events", "band_id"):
-                conn.execute("ALTER TABLE events ADD COLUMN band_id TEXT;")
-                conn.commit()
-            if not _table_has_column(conn, "events", "band_name"):
-                conn.execute("ALTER TABLE events ADD COLUMN band_name TEXT;")
-                conn.commit()
-
-# Preenche band_name em eventos antigos que ficaram NULL após adicionar a coluna
-conn.execute("UPDATE events SET band_name='Banda' WHERE band_name IS NULL OR TRIM(band_name)='';")
-conn.commit()
-        finally:
-            conn.close()
-
-# ----------------- Models -----------------
-
-class BandBase(BaseModel):
+# -------- Models --------
+class BandCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=120)
     city: Optional[str] = Field(default=None, max_length=80)
-    notes: Optional[str] = Field(default=None, max_length=1000)
 
-class BandCreate(BandBase):
-    pass
+    @field_validator("name", "city", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return v
 
-class Band(BandBase):
+class BandItem(BaseModel):
     id: str
+    name: str
+    city: Optional[str] = None
     created_at: str
     updated_at: str
 
-class EventBase(BaseModel):
-    # Selecione uma banda cadastrada (band_id) OU preencha o nome (band_name)
-    band_id: Optional[str] = Field(default=None, description="ID da banda (se cadastrado)")
-    band_name: Optional[str] = Field(default=None, max_length=120, description="Nome da banda/artista (texto)")
-
+class EventCreate(BaseModel):
+    band_id: Optional[str] = None
     event_name: str = Field(..., min_length=2, max_length=120)
     contractor_name: str = Field(..., min_length=2, max_length=120)
-    contact: str = Field(..., min_length=2, max_length=120, description="Phone/WhatsApp/email")
+    contact: str = Field(..., min_length=2, max_length=120)
     date: str = Field(..., description="YYYY-MM-DD")
     time: str = Field(..., description="HH:MM")
     address: str = Field(..., min_length=5, max_length=240)
@@ -131,55 +120,135 @@ class EventBase(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=2000)
     status: str = Field(default="planned", max_length=30)
 
-    @field_validator("band_id", "band_name", "city", "state", "postal_code", "notes", "status", mode="before")
+    @field_validator(
+        "band_id","event_name","contractor_name","contact","date","time","address",
+        "city","state","postal_code","notes","status", mode="before"
+    )
     @classmethod
-    def _empty_to_none(cls, v, info):
+    def _strip_all(cls, v):
         if v is None:
             return None
         if isinstance(v, str):
-            v2 = v.strip()
-            if v2 == "":
-                return "planned" if getattr(info, 'field_name', '') == 'status' else None
-            return v2
+            s = v.strip()
+            return s if s else None
         return v
 
     @model_validator(mode="after")
-    def _check_band(self):
-        if not self.band_id and not self.band_name:
-            raise ValueError("Informe a banda: selecione uma banda cadastrada ou preencha o nome da banda.")
-        # normalize status fallback
+    def _validate(self):
+        if not self.band_id:
+            raise ValueError("Selecione a banda (band_id).")
         if not self.status:
             self.status = "planned"
         return self
 
-class EventCreate(EventBase):
-    pass
-
-class EventUpdate(BaseModel):
-    band_id: Optional[str] = None
-    band_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
-
-    event_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
-    contractor_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
-    contact: Optional[str] = Field(default=None, min_length=2, max_length=120)
-    date: Optional[str] = None
-    time: Optional[str] = None
-    address: Optional[str] = Field(default=None, min_length=5, max_length=240)
-
-    city: Optional[str] = Field(default=None, max_length=80)
-    state: Optional[str] = Field(default=None, max_length=80)
-    postal_code: Optional[str] = Field(default=None, max_length=30)
-    notes: Optional[str] = Field(default=None, max_length=2000)
-    status: Optional[str] = Field(default=None, max_length=30)
-
-class Event(EventBase):
+class EventItem(BaseModel):
     id: str
+    band_id: Optional[str] = None
+    band_name: str
+    event_name: str
+    contractor_name: str
+    contact: str
+    date: str
+    time: str
+    address: str
+    city: Optional[str] = None
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
+    notes: Optional[str] = None
+    status: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="4.1.1")
+class DistanceResult(BaseModel):
+    origin: str
+    destination: str
+    distance_text: str
+    duration_text: str
+    distance_meters: int
+    duration_seconds: int
 
-def _add_cors_headers(request: Request, response: Response):
+class ItineraryStep(BaseModel):
+    from_event_id: str
+    to_event_id: str
+    from_label: str
+    to_label: str
+    distance: Optional[DistanceResult] = None
+
+# -------- Google Maps --------
+def require_maps():
+    if not GOOGLE_MAPS_API_KEY:
+        raise HTTPException(status_code=400, detail="GOOGLE_MAPS_API_KEY não configurada no backend.")
+
+def geocode_address(address: str) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str], Optional[str]]:
+    require_maps()
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    r = requests.get(url, params={"address": address, "key": GOOGLE_MAPS_API_KEY}, timeout=20)
+    data = r.json()
+    if data.get("status") != "OK" or not data.get("results"):
+        return (None, None, None, None, None)
+
+    res = data["results"][0]
+    loc = res["geometry"]["location"]
+    lat, lng = loc.get("lat"), loc.get("lng")
+
+    city = state = postal = None
+    for comp in res.get("address_components", []):
+        types = comp.get("types", [])
+        if "locality" in types and not city:
+            city = comp.get("long_name")
+        if "administrative_area_level_1" in types and not state:
+            state = comp.get("short_name") or comp.get("long_name")
+        if "postal_code" in types and not postal:
+            postal = comp.get("long_name")
+
+    return (lat, lng, city, state, postal)
+
+def distance_matrix(origin: str, destination: str) -> DistanceResult:
+    require_maps()
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    r = requests.get(url, params={
+        "origins": origin,
+        "destinations": destination,
+        "key": GOOGLE_MAPS_API_KEY,
+        "mode": "driving",
+        "language": "pt-BR",
+        "region": "br",
+    }, timeout=20)
+    data = r.json()
+    if data.get("status") != "OK":
+        raise HTTPException(status_code=400, detail=f"DistanceMatrix status={data.get('status')}")
+    row0 = (data.get("rows") or [{}])[0]
+    el0 = (row0.get("elements") or [{}])[0]
+    if el0.get("status") != "OK":
+        raise HTTPException(status_code=400, detail=f"DistanceMatrix element status={el0.get('status')}")
+    dist = el0["distance"]
+    dur = el0["duration"]
+    return DistanceResult(
+        origin=origin,
+        destination=destination,
+        distance_text=dist.get("text", ""),
+        duration_text=dur.get("text", ""),
+        distance_meters=int(dist.get("value", 0)),
+        duration_seconds=int(dur.get("value", 0)),
+    )
+
+# -------- FastAPI app --------
+app = FastAPI(title="AgendaBanda API", version=VERSION)
+
+frontend_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=frontend_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
+)
+
+def add_cors_headers(request: Request, response: Response):
     origin = request.headers.get("origin")
     response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
     response.headers["Vary"] = "Origin"
@@ -189,523 +258,276 @@ def _add_cors_headers(request: Request, response: Response):
     return response
 
 @app.exception_handler(RequestValidationError)
-async def _validation_exc_handler(request: Request, exc: RequestValidationError):
+async def validation_exc(request: Request, exc: RequestValidationError):
     res = JSONResponse(status_code=422, content={"detail": exc.errors()})
-    return _add_cors_headers(request, res)
+    return add_cors_headers(request, res)
 
 @app.exception_handler(HTTPException)
-async def _http_exc_handler(request: Request, exc: HTTPException):
+async def http_exc(request: Request, exc: HTTPException):
     res = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    return _add_cors_headers(request, res)
+    return add_cors_headers(request, res)
 
 @app.exception_handler(Exception)
-async def _any_exc_handler(request: Request, exc: Exception):
+async def any_exc(request: Request, exc: Exception):
     res = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-    return _add_cors_headers(request, res)
-
-
-# --- CORS (para Netlify) ---
-# Libera durante testes. Depois a gente trava só para o seu domínio.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=".*",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
-)
-
-@app.middleware("http")
-async def _force_cors_headers(request: Request, call_next):
-    # Garante headers mesmo em respostas de erro
-    response = await call_next(request)
-    origin = request.headers.get("origin")
-    response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
-    response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = request.headers.get("access-control-request-headers", "*")
-    return response
+    return add_cors_headers(request, res)
 
 @app.options("/{full_path:path}")
-def _preflight(full_path: str, request: Request):
-    return Response(status_code=200)
-
-@app.get("/debug/cors")
-def debug_cors(request: Request):
-    return {
-        "ok": True,
-        "origin": request.headers.get("origin"),
-        "note": "CORS habilitado (teste): Access-Control-Allow-Origin será ecoado quando houver Origin.",
-    }
-
-
-# CORS (modo teste / Netlify)
-# Forçamos CORS permissivo para evitar bloqueio no browser durante ajustes.
-# Depois que estiver 100%, você pode restringir (eu faço pra você).
-# Fallback extra: garante header mesmo em respostas de erro / 404.
-
-# Preflight handler (OPTIONS) para qualquer rota
-
+def preflight(full_path: str, request: Request):
+    return add_cors_headers(request, Response(status_code=200))
 
 @app.on_event("startup")
-def _startup():
+def on_startup():
     init_db()
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "version": "4.1.1"}
+    return {"ok": True, "app": APP_NAME, "version": VERSION, "db_path": DB_PATH}
 
-@app.get("/debug/cors")
-def debug_cors(origin: str | None = None):
-    # origin param é opcional; o navegador envia o header Origin automaticamente
-    return {
-        "allow_origins_env": os.getenv("FRONTEND_ORIGINS", ""),
-        "allow_origin_regex_env": os.getenv("FRONTEND_ORIGIN_REGEX", ""),
-        "note": "Use o DevTools/Network para ver Access-Control-Allow-Origin no response.",
-        "origin_param": origin,
-    }
+# -------- Bands --------
+@app.get("/api/bands", response_model=List[BandItem])
+def list_bands():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM bands ORDER BY name ASC").fetchall()
+    conn.close()
+    return [BandItem(**row_to_dict(r)) for r in rows]
 
-# ----------------- Helpers -----------------
-
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    d = dict(row)
-
-    # Normalizações para compatibilidade com DB antigo (evita 500 na serialização)
-    if d.get("status") in (None, ""):
-        d["status"] = "planned"
-
-    # band_name pode vir NULL em DB antigo (coluna adicionada por migration)
-    if d.get("band_name") in (None, ""):
-        d["band_name"] = "Banda"
-
-    # timestamps obrigatórios nos modelos de resposta
-    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    if d.get("created_at") in (None, ""):
-        d["created_at"] = now
-    if d.get("updated_at") in (None, ""):
-        d["updated_at"] = d.get("created_at") or now
-
-    # strings vazias -> None para campos opcionais
-    for k in ["band_id", "band_name", "city", "state", "postal_code", "notes"]:
-        if k in d and isinstance(d[k], str) and d[k].strip() == "":
-            d[k] = None
-
-    return d
-
-def _require_key():
-    if not GOOGLE_MAPS_API_KEY:
-        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY não configurada no Railway (Variables).")
-
-def _distance_matrix_single(origem: str, destino: str, mode: str = "driving") -> Dict[str, Any]:
-    _require_key()
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    r = requests.get(
-        url,
-        params={
-            "origins": origem,
-            "destinations": destino,
-            "mode": mode,
-            "language": "pt-BR",
-            "region": "br",
-            "key": GOOGLE_MAPS_API_KEY,
-        },
-        timeout=20,
-    )
-    data = r.json()
-    if data.get("status") != "OK":
-        return {"ok": False, "status": data.get("status"), "raw": data}
-    rows = data.get("rows") or []
-    if not rows or not rows[0].get("elements"):
-        return {"ok": False, "status": "NO_ELEMENTS", "raw": data}
-    el = rows[0]["elements"][0]
-    if el.get("status") != "OK":
-        return {"ok": False, "status": el.get("status"), "raw": data}
-    return {
-        "ok": True,
-        "origem": data.get("origin_addresses", [origem])[0],
-        "destino": data.get("destination_addresses", [destino])[0],
-        "distance_text": el["distance"]["text"],
-        "distance_meters": el["distance"]["value"],
-        "duration_text": el["duration"]["text"],
-        "duration_seconds": el["duration"]["value"],
-        "mode": mode,
-    }
-
-def _resolve_band_name(conn: sqlite3.Connection, band_id: Optional[str], band_name_fallback: str) -> str:
-    if not band_id:
-        return band_name_fallback
-    row = conn.execute("SELECT name FROM bands WHERE id = ?", (band_id,)).fetchone()
-    return (row["name"] if row and row.get("name") else band_name_fallback)
-
-# ----------------- Bands CRUD -----------------
-
-@app.get("/api/bands", response_model=List[Band])
-def list_bands(limit: int = Query(default=500, ge=1, le=5000)):
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            rows = conn.execute("SELECT * FROM bands ORDER BY LOWER(name) ASC LIMIT ?", (limit,)).fetchall()
-        finally:
-            conn.close()
-    return [_row_to_dict(r) for r in rows]
-
-@app.post("/api/bands", response_model=Band)
+@app.post("/api/bands", response_model=BandItem)
 def create_band(payload: BandCreate):
-    band_id = str(uuid4())
-    now = _now_iso()
-    name = payload.name.strip()
-
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            # enforce unique (case-insensitive) in app layer too
-            exists = conn.execute("SELECT id FROM bands WHERE LOWER(name)=LOWER(?)", (name,)).fetchone()
-            if exists:
-                raise HTTPException(status_code=400, detail="Banda já cadastrada.")
-            conn.execute(
-                """
-                INSERT INTO bands (id, name, city, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (band_id, name, payload.city, payload.notes, now, now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    return {"id": band_id, "name": name, "city": payload.city, "notes": payload.notes, "created_at": now, "updated_at": now}
+    conn = get_conn()
+    cur = conn.cursor()
+    now = utc_now()
+    band_id = f"band_{int(datetime.utcnow().timestamp()*1000)}"
+    cur.execute(
+        "INSERT INTO bands(id,name,city,created_at,updated_at) VALUES(?,?,?,?,?)",
+        (band_id, payload.name, payload.city, now, now),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM bands WHERE id=?", (band_id,)).fetchone()
+    conn.close()
+    return BandItem(**row_to_dict(row))
 
 @app.delete("/api/bands/{band_id}")
 def delete_band(band_id: str):
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            # keep events intact; only detach band_id
-            conn.execute("UPDATE events SET band_id = NULL WHERE band_id = ?", (band_id,))
-            cur = conn.execute("DELETE FROM bands WHERE id = ?", (band_id,))
-            conn.commit()
-        finally:
-            conn.close()
-    if cur.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Banda não encontrada.")
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM events WHERE band_id=?", (band_id,))
+    cur.execute("DELETE FROM bands WHERE id=?", (band_id,))
+    conn.commit()
+    conn.close()
     return {"ok": True}
 
-# ----------------- Events CRUD -----------------
-
-@app.post("/api/events", response_model=Event)
-def create_event(payload: EventCreate):
-    event_id = str(uuid4())
-    now = _now_iso()
-
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            band_name = _resolve_band_name(conn, payload.band_id, (payload.band_name or '')).strip()
-            if not band_name:
-                raise HTTPException(status_code=400, detail='Banda é obrigatória.')
-            conn.execute(
-                """
-                INSERT INTO events (
-                    id, band_id, band_name, event_name, contractor_name, contact, date, time, address,
-                    city, state, postal_code, notes, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event_id,
-                    payload.band_id,
-                    band_name,
-                    payload.event_name,
-                    payload.contractor_name,
-                    payload.contact,
-                    payload.date,
-                    payload.time,
-                    payload.address,
-                    payload.city,
-                    payload.state,
-                    payload.postal_code,
-                    payload.notes,
-                    payload.status or "planned",
-                    now,
-                    now,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    data = payload.model_dump()
-    data["band_name"] = band_name
-    return {"id": event_id, "created_at": now, "updated_at": now, **data}
-
-@app.get("/api/events", response_model=List[Event])
-def list_events(limit: int = Query(default=2000, ge=1, le=5000)):
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM events ORDER BY date ASC, time ASC, created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        finally:
-            conn.close()
-    return [_row_to_dict(r) for r in rows]
-
-@app.get("/api/events/{event_id}", response_model=Event)
-def get_event(event_id: str):
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-        finally:
-            conn.close()
+# -------- Events --------
+def resolve_band_name(conn: sqlite3.Connection, band_id: str) -> str:
+    row = conn.execute("SELECT name FROM bands WHERE id=?", (band_id,)).fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return _row_to_dict(row)
+        raise HTTPException(status_code=400, detail="Banda não encontrada. Cadastre/seleciona uma banda válida.")
+    name = (row["name"] or "").strip()
+    return name if name else "Banda"
 
-@app.put("/api/events/{event_id}", response_model=Event)
-def update_event(event_id: str, payload: EventUpdate):
-    now = _now_iso()
-    data = {k: v for k, v in payload.model_dump().items() if v is not None}
-    if not data:
-        raise HTTPException(status_code=400, detail="No fields to update")
+@app.get("/api/events", response_model=List[EventItem])
+def list_events(
+    date: Optional[str] = Query(default=None),
+    band_id: Optional[str] = Query(default=None),
+    city: Optional[str] = Query(default=None),
+):
+    conn = get_conn()
+    q = "SELECT * FROM events WHERE 1=1"
+    params: List[Any] = []
+    if date:
+        q += " AND date=?"
+        params.append(date)
+    if band_id:
+        q += " AND band_id=?"
+        params.append(band_id)
+    if city:
+        q += " AND lower(city)=lower(?)"
+        params.append(city)
+    q += " ORDER BY date ASC, time ASC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [EventItem(**row_to_dict(r)) for r in rows]
 
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            if "band_id" in data or "band_name" in data:
-                bid = data.get("band_id")
-                bname = data.get("band_name")
-                # if band_id changed, resolve official name; else keep provided
-                if "band_id" in data:
-                    resolved = _resolve_band_name(conn, bid, bname or "")
-                    data["band_name"] = resolved.strip() if resolved else (bname or "")
-                elif "band_name" in data:
-                    data["band_name"] = data["band_name"].strip()
+@app.post("/api/events", response_model=EventItem)
+def create_event(payload: EventCreate):
+    conn = get_conn()
+    cur = conn.cursor()
+    now = utc_now()
+    eid = f"evt_{int(datetime.utcnow().timestamp()*1000)}"
+    band_name = resolve_band_name(conn, payload.band_id)
 
-            set_parts = [f"{k} = ?" for k in data.keys()]
-            params = list(data.values())
-            set_parts.append("updated_at = ?")
-            params.append(now)
-            params.append(event_id)
+    lat = lng = None
+    g_city = g_state = g_postal = None
+    try:
+        lat, lng, g_city, g_state, g_postal = geocode_address(payload.address)
+    except Exception:
+        pass
 
-            cur = conn.execute(f"UPDATE events SET {', '.join(set_parts)} WHERE id = ?", tuple(params))
-            conn.commit()
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Event not found")
-            row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-        finally:
-            conn.close()
+    city = payload.city or g_city
+    state = payload.state or g_state
+    postal = payload.postal_code or g_postal
 
-    return _row_to_dict(row)
+    cur.execute(
+        """
+        INSERT INTO events(
+            id, band_id, band_name, event_name, contractor_name, contact,
+            date, time, address, city, state, postal_code, notes, status,
+            lat, lng, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            eid, payload.band_id, band_name, payload.event_name, payload.contractor_name, payload.contact,
+            payload.date, payload.time, payload.address, city, state, postal, payload.notes, payload.status or "planned",
+            lat, lng, now, now
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
+    conn.close()
+    return EventItem(**row_to_dict(row))
 
 @app.delete("/api/events/{event_id}")
 def delete_event(event_id: str):
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            cur = conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
-            conn.commit()
-        finally:
-            conn.close()
-    if cur.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Event not found")
+    conn = get_conn()
+    conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+    conn.commit()
+    conn.close()
     return {"ok": True}
 
-# ----------------- Google Maps -----------------
+# -------- Distance / Itinerary --------
+@app.get("/api/distancia", response_model=DistanceResult)
+def distancia(origem: str = Query(...), destino: str = Query(...)):
+    return distance_matrix(origem, destino)
 
-@app.get("/api/geocode")
-def geocode(address: str = Query(..., min_length=5)):
-    _require_key()
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    try:
-        r = requests.get(url, params={"address": address, "key": GOOGLE_MAPS_API_KEY}, timeout=20)
-        data = r.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao chamar Geocoding: {e}")
+@app.get("/api/itinerary", response_model=List[ItineraryStep])
+def itinerary(band_id: str = Query(...), date: str = Query(...)):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM events WHERE band_id=? AND date=? ORDER BY time ASC",
+        (band_id, date),
+    ).fetchall()
+    events = [EventItem(**row_to_dict(r)) for r in rows]
+    conn.close()
 
-    if data.get("status") != "OK" or not data.get("results"):
-        return {"ok": False, "status": data.get("status"), "results": []}
+    if len(events) < 2:
+        return []
 
-    top = data["results"][0]
-    loc = top["geometry"]["location"]
-    return {
-        "ok": True,
-        "formatted_address": top.get("formatted_address"),
-        "place_id": top.get("place_id"),
-        "lat": loc.get("lat"),
-        "lng": loc.get("lng"),
-        "raw_status": data.get("status"),
-    }
+    steps: List[ItineraryStep] = []
+    for i in range(len(events) - 1):
+        a = events[i]
+        b = events[i + 1]
+        label_a = f"{a.time} • {a.event_name} • {a.address}"
+        label_b = f"{b.time} • {b.event_name} • {b.address}"
+        dist = None
+        try:
+            dist = distance_matrix(a.address, b.address)
+        except Exception:
+            dist = None
+        steps.append(
+            ItineraryStep(
+                from_event_id=a.id,
+                to_event_id=b.id,
+                from_label=label_a,
+                to_label=label_b,
+                distance=dist,
+            )
+        )
+    return steps
 
-@app.get("/api/distancia")
-def distance_matrix(
-    origem: str = Query(..., min_length=3),
-    destino: str = Query(..., min_length=3),
-    mode: str = Query(default="driving"),
-):
-    try:
-        return _distance_matrix_single(origem, destino, mode=mode)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Erro ao chamar Distance Matrix: {e}")
-
-# ----------------- Reports -----------------
-
-@app.get("/api/reports/events", response_model=List[Event])
-def report_events(
-    band: Optional[str] = Query(default=None),
-    date: Optional[str] = Query(default=None),
-    city: Optional[str] = Query(default=None),
-    limit: int = Query(default=5000, ge=1, le=10000),
-):
-    where = []
+# -------- Reports (PDF) --------
+def fetch_events_for_report(conn: sqlite3.Connection, band_id: Optional[str], date: Optional[str], city: Optional[str]) -> List[Dict[str, Any]]:
+    q = "SELECT * FROM events WHERE 1=1"
     params: List[Any] = []
-    if band:
-        where.append("LOWER(band_name) = LOWER(?)")
-        params.append(band)
+    if band_id:
+        q += " AND band_id=?"
+        params.append(band_id)
     if date:
-        where.append("date = ?")
+        q += " AND date=?"
         params.append(date)
     if city:
-        where.append("LOWER(COALESCE(city,'')) = LOWER(?)")
+        q += " AND lower(city)=lower(?)"
         params.append(city)
-
-    sql = "SELECT * FROM events"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY date ASC, time ASC, created_at DESC LIMIT ?"
-    params.append(limit)
-
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            rows = conn.execute(sql, tuple(params)).fetchall()
-        finally:
-            conn.close()
-
-    return [_row_to_dict(r) for r in rows]
-
-@app.get("/api/reports/itinerary")
-def report_itinerary(
-    band: str = Query(..., min_length=2),
-    date: str = Query(..., min_length=10),
-    mode: str = Query(default="driving"),
-):
-    with _db_lock:
-        conn = _get_conn()
-        try:
-            rows = conn.execute(
-                "SELECT * FROM events WHERE LOWER(band_name)=LOWER(?) AND date=? ORDER BY time ASC",
-                (band, date),
-            ).fetchall()
-        finally:
-            conn.close()
-
-    events = [_row_to_dict(r) for r in rows]
-    legs: List[Dict[str, Any]] = []
-
-    if len(events) >= 2:
-        for i in range(len(events) - 1):
-            a = events[i]
-            b = events[i + 1]
-            try:
-                dist = _distance_matrix_single(a["address"], b["address"], mode=mode)
-            except HTTPException as he:
-                dist = {"ok": False, "status": "ERROR", "detail": he.detail}
-            legs.append(
-                {
-                    "from_event_id": a["id"],
-                    "to_event_id": b["id"],
-                    "from_time": a["time"],
-                    "to_time": b["time"],
-                    "from_address": a["address"],
-                    "to_address": b["address"],
-                    "distance": dist,
-                }
-            )
-
-    return {"ok": True, "band": band, "date": date, "events": events, "legs": legs}
-
-def _pdf_bytes(title: str, lines: List[str]) -> bytes:
-    if canvas is None:
-        raise HTTPException(status_code=500, detail="PDF não disponível (dependência reportlab ausente).")
-
-    import io
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-
-    x = 18 * mm
-    y = height - 18 * mm
-
-    c.setTitle(title)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y, title)
-    y -= 10 * mm
-
-    c.setFont("Helvetica", 10)
-    for line in lines:
-        if y < 18 * mm:
-            c.showPage()
-            y = height - 18 * mm
-            c.setFont("Helvetica", 10)
-        c.drawString(x, y, line[:140])
-        y -= 6 * mm
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
+    q += " ORDER BY date ASC, time ASC"
+    rows = conn.execute(q, params).fetchall()
+    return [row_to_dict(r) for r in rows]
 
 @app.get("/api/reports/pdf")
 def report_pdf(
-    band: Optional[str] = Query(default=None),
+    band_id: Optional[str] = Query(default=None),
     date: Optional[str] = Query(default=None),
     city: Optional[str] = Query(default=None),
+    mode: str = Query(default="list", description="list | itinerary"),
 ):
-    title = "Relatório de Eventos"
+    conn = get_conn()
+    items = fetch_events_for_report(conn, band_id, date, city)
+    conn.close()
+
+    itinerary_steps: List[ItineraryStep] = []
+    if mode == "itinerary" and band_id and date:
+        itinerary_steps = itinerary(band_id=band_id, date=date)  # type: ignore
+
+    buff = BytesIO()
+    c = canvas.Canvas(buff, pagesize=A4)
+    w, h = A4
+
+    y = h - 48
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, y, f"Relatório • {APP_NAME}")
+    y -= 18
+
+    c.setFont("Helvetica", 10)
     filters = []
-    if band:
-        filters.append(f"Banda: {band}")
+    if band_id:
+        filters.append(f"Banda: {band_id}")
     if date:
         filters.append(f"Data: {date}")
     if city:
         filters.append(f"Cidade: {city}")
-    if filters:
-        title += " (" + " | ".join(filters) + ")"
+    c.drawString(40, y, " | ".join(filters) if filters else "Sem filtros")
+    y -= 22
 
-    events = report_events(band=band, date=date, city=city, limit=10000)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(40, y, "Eventos")
+    y -= 14
+    c.setFont("Helvetica", 9)
 
-    lines: List[str] = []
-    lines.append("Filtros: " + (", ".join(filters) if filters else "nenhum"))
-    lines.append(" ")
-    lines.append("Eventos:")
-    if not events:
-        lines.append(" - (nenhum)")
-    else:
-        for ev in events:
-            lines.append(f" - {ev['date']} {ev['time']} | {ev['band_name']} | {ev['event_name']} | {ev.get('city') or '-'} | {ev['address']}")
+    for ev in items:
+        line = f"{ev.get('date')} {ev.get('time')} • {ev.get('band_name')} • {ev.get('event_name')} • {ev.get('city') or '-'} • {ev.get('address')}"
+        for chunk in textwrap.wrap(line, width=110):
+            c.drawString(40, y, chunk)
+            y -= 12
+            if y < 60:
+                c.showPage()
+                y = h - 48
+                c.setFont("Helvetica", 9)
+        y -= 4
 
-    if band and date:
-        it = report_itinerary(band=band, date=date)
-        lines.append(" ")
-        lines.append("Roteiro (do 1º show ao próximo):")
-        if not it["legs"]:
-            lines.append(" - (apenas 1 evento no dia)")
-        else:
-            for leg in it["legs"]:
-                d = leg["distance"]
-                if d.get("ok"):
-                    lines.append(f" - {leg['from_time']} -> {leg['to_time']} | {d['distance_text']} | {d['duration_text']}")
-                else:
-                    lines.append(f" - {leg['from_time']} -> {leg['to_time']} | (falha ao calcular)")
+    if itinerary_steps:
+        if y < 140:
+            c.showPage()
+            y = h - 48
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(40, y, "Itinerário (rotas)")
+        y -= 14
+        c.setFont("Helvetica", 9)
+        for st in itinerary_steps:
+            dist = st.distance.model_dump() if st.distance else {}
+            line = f"{st.from_label} -> {st.to_label} | {dist.get('distance_text','-')} • {dist.get('duration_text','-')}"
+            for chunk in textwrap.wrap(line, width=110):
+                c.drawString(40, y, chunk)
+                y -= 12
+                if y < 60:
+                    c.showPage()
+                    y = h - 48
+                    c.setFont("Helvetica", 9)
+            y -= 4
 
-    pdf = _pdf_bytes(title, lines)
-    filename = "relatorio_eventos.pdf"
+    c.showPage()
+    c.save()
+    buff.seek(0)
+
     return StreamingResponse(
-        iter([pdf]),
+        buff,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": 'inline; filename="relatorio_agendabanda.pdf"'},
     )
