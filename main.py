@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import json
 import textwrap
 from datetime import datetime
 from io import BytesIO
@@ -14,74 +14,85 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 APP_NAME = "AgendaBanda"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
-DB_PATH = os.getenv("DB_PATH", "/tmp/agendabanda.db")
+
+# Aceita qualquer uma dessas envs (você disse que já tem o JSON no Railway):
+SERVICE_ACCOUNT_ENV_CANDIDATES = [
+    "FIREBASE_SERVICE_ACCOUNT_JSON",
+    "FIREBASE_ADMIN_SDK_JSON",
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+    "FIREBASE_CREDENTIALS_JSON",
+]
+
+BANDS_COLLECTION = os.getenv("FIRESTORE_BANDS_COLLECTION", "bands")
+EVENTS_COLLECTION = os.getenv("FIRESTORE_EVENTS_COLLECTION", "events")
+
 
 def utc_now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
-def init_db() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bands (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            city TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            id TEXT PRIMARY KEY,
-            band_id TEXT,
-            band_name TEXT NOT NULL,
-            event_name TEXT NOT NULL,
-            contractor_name TEXT NOT NULL,
-            contact TEXT NOT NULL,
-            date TEXT NOT NULL,
-            time TEXT NOT NULL,
-            address TEXT NOT NULL,
-            city TEXT,
-            state TEXT,
-            postal_code TEXT,
-            notes TEXT,
-            status TEXT NOT NULL,
-            lat REAL,
-            lng REAL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events(date)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_band_date ON events(band_id, date)")
-    conn.commit()
-    conn.close()
+def require_maps():
+    if not GOOGLE_MAPS_API_KEY:
+        raise HTTPException(status_code=400, detail="GOOGLE_MAPS_API_KEY não configurada no backend.")
 
-def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    d = dict(row)
+
+def _get_service_account_json() -> str:
+    for k in SERVICE_ACCOUNT_ENV_CANDIDATES:
+        v = os.getenv(k, "").strip()
+        if v:
+            return v
+    # fallback: caminho em arquivo, se preferir usar
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
+def init_firebase() -> firestore.Client:
+    if firebase_admin._apps:
+        return firestore.client()
+
+    raw = _get_service_account_json()
+    if not raw:
+        raise RuntimeError(
+            "Credenciais Firebase não encontradas. Defina uma env com o JSON da service account "
+            "(ex: FIREBASE_SERVICE_ACCOUNT_JSON) ou GOOGLE_APPLICATION_CREDENTIALS."
+        )
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"JSON inválido nas credenciais Firebase: {e}")
+
+    cred = credentials.Certificate(data)
+    firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+def db() -> firestore.Client:
+    try:
+        return init_firebase()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def row_defaults(d: Dict[str, Any]) -> Dict[str, Any]:
     if not d.get("status"):
         d["status"] = "planned"
     if not d.get("created_at"):
         d["created_at"] = utc_now()
     if not d.get("updated_at"):
         d["updated_at"] = d["created_at"]
-    if not d.get("band_name"):
-        d["band_name"] = "Banda"
     return d
+
 
 # -------- Models --------
 class BandCreate(BaseModel):
@@ -98,12 +109,14 @@ class BandCreate(BaseModel):
             return s if s else None
         return v
 
+
 class BandItem(BaseModel):
     id: str
     name: str
     city: Optional[str] = None
     created_at: str
     updated_at: str
+
 
 class EventCreate(BaseModel):
     band_id: Optional[str] = None
@@ -141,6 +154,7 @@ class EventCreate(BaseModel):
             self.status = "planned"
         return self
 
+
 class EventItem(BaseModel):
     id: str
     band_id: Optional[str] = None
@@ -161,6 +175,7 @@ class EventItem(BaseModel):
     created_at: str
     updated_at: str
 
+
 class DistanceResult(BaseModel):
     origin: str
     destination: str
@@ -169,6 +184,7 @@ class DistanceResult(BaseModel):
     distance_meters: int
     duration_seconds: int
 
+
 class ItineraryStep(BaseModel):
     from_event_id: str
     to_event_id: str
@@ -176,11 +192,8 @@ class ItineraryStep(BaseModel):
     to_label: str
     distance: Optional[DistanceResult] = None
 
-# -------- Google Maps --------
-def require_maps():
-    if not GOOGLE_MAPS_API_KEY:
-        raise HTTPException(status_code=400, detail="GOOGLE_MAPS_API_KEY não configurada no backend.")
 
+# -------- Google Maps --------
 def geocode_address(address: str) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str], Optional[str]]:
     require_maps()
     url = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -204,6 +217,7 @@ def geocode_address(address: str) -> Tuple[Optional[float], Optional[float], Opt
             postal = comp.get("long_name")
 
     return (lat, lng, city, state, postal)
+
 
 def distance_matrix(origin: str, destination: str) -> DistanceResult:
     require_maps()
@@ -233,6 +247,7 @@ def distance_matrix(origin: str, destination: str) -> DistanceResult:
         distance_meters=int(dist.get("value", 0)),
         duration_seconds=int(dur.get("value", 0)),
     )
+
 
 # -------- FastAPI app --------
 app = FastAPI(title="AgendaBanda API", version=VERSION)
@@ -276,85 +291,113 @@ async def any_exc(request: Request, exc: Exception):
 def preflight(full_path: str, request: Request):
     return add_cors_headers(request, Response(status_code=200))
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "version": VERSION, "db_path": DB_PATH}
+    _ = db()
+    return {"ok": True, "app": APP_NAME, "version": VERSION, "bands_collection": BANDS_COLLECTION, "events_collection": EVENTS_COLLECTION}
+
+
+# -------- Helpers (Firestore) --------
+def bands_col():
+    return db().collection(BANDS_COLLECTION)
+
+def events_col():
+    return db().collection(EVENTS_COLLECTION)
+
+def band_from_doc(doc) -> Dict[str, Any]:
+    d = doc.to_dict() or {}
+    d["id"] = doc.id
+    if not d.get("created_at"):
+        d["created_at"] = utc_now()
+    if not d.get("updated_at"):
+        d["updated_at"] = d["created_at"]
+    return d
+
+def event_from_doc(doc) -> Dict[str, Any]:
+    d = doc.to_dict() or {}
+    d["id"] = doc.id
+    d = row_defaults(d)
+    if not d.get("band_name"):
+        d["band_name"] = "Banda"
+    return d
+
+def get_band_name(band_id: str) -> str:
+    snap = bands_col().document(band_id).get()
+    if not snap.exists:
+        raise HTTPException(status_code=400, detail="Banda não encontrada. Cadastre/seleciona uma banda válida.")
+    d = snap.to_dict() or {}
+    name = (d.get("name") or "").strip()
+    return name if name else "Banda"
+
 
 # -------- Bands --------
 @app.get("/api/bands", response_model=List[BandItem])
 def list_bands():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM bands ORDER BY name ASC").fetchall()
-    conn.close()
-    return [BandItem(**row_to_dict(r)) for r in rows]
+    docs = list(bands_col().stream())
+    items = [BandItem(**band_from_doc(d)) for d in docs]
+    items.sort(key=lambda x: (x.name or "").lower())
+    return items
 
 @app.post("/api/bands", response_model=BandItem)
 def create_band(payload: BandCreate):
-    conn = get_conn()
-    cur = conn.cursor()
     now = utc_now()
     band_id = f"band_{int(datetime.utcnow().timestamp()*1000)}"
-    cur.execute(
-        "INSERT INTO bands(id,name,city,created_at,updated_at) VALUES(?,?,?,?,?)",
-        (band_id, payload.name, payload.city, now, now),
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM bands WHERE id=?", (band_id,)).fetchone()
-    conn.close()
-    return BandItem(**row_to_dict(row))
+    data = {"name": payload.name, "city": payload.city, "created_at": now, "updated_at": now}
+    bands_col().document(band_id).set(data)
+    return BandItem(id=band_id, **data)
 
 @app.delete("/api/bands/{band_id}")
 def delete_band(band_id: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM events WHERE band_id=?", (band_id,))
-    cur.execute("DELETE FROM bands WHERE id=?", (band_id,))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
+    client = db()
+    batch = client.batch()
+    ev_docs = list(events_col().where("band_id", "==", band_id).stream())
+    for d in ev_docs:
+        batch.delete(d.reference)
+    batch.delete(bands_col().document(band_id))
+    batch.commit()
+    return {"ok": True, "deleted_events": len(ev_docs)}
+
 
 # -------- Events --------
-def resolve_band_name(conn: sqlite3.Connection, band_id: str) -> str:
-    row = conn.execute("SELECT name FROM bands WHERE id=?", (band_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=400, detail="Banda não encontrada. Cadastre/seleciona uma banda válida.")
-    name = (row["name"] or "").strip()
-    return name if name else "Banda"
-
 @app.get("/api/events", response_model=List[EventItem])
 def list_events(
     date: Optional[str] = Query(default=None),
     band_id: Optional[str] = Query(default=None),
     city: Optional[str] = Query(default=None),
 ):
-    conn = get_conn()
-    q = "SELECT * FROM events WHERE 1=1"
-    params: List[Any] = []
+    # Para não depender de índices compostos, usamos no máximo 1 filtro no Firestore.
+    q = events_col()
+    chosen = None
     if date:
-        q += " AND date=?"
-        params.append(date)
-    if band_id:
-        q += " AND band_id=?"
-        params.append(band_id)
-    if city:
-        q += " AND lower(city)=lower(?)"
-        params.append(city)
-    q += " ORDER BY date ASC, time ASC"
-    rows = conn.execute(q, params).fetchall()
-    conn.close()
-    return [EventItem(**row_to_dict(r)) for r in rows]
+        q = q.where("date", "==", date)
+        chosen = "date"
+    elif band_id:
+        q = q.where("band_id", "==", band_id)
+        chosen = "band_id"
+    elif city:
+        q = q.where("city_lower", "==", city.strip().lower())
+        chosen = "city"
+
+    docs = list(q.stream())
+    items = [EventItem(**event_from_doc(d)) for d in docs]
+
+    if chosen != "date" and date:
+        items = [x for x in items if x.date == date]
+    if chosen != "band_id" and band_id:
+        items = [x for x in items if (x.band_id or "") == band_id]
+    if chosen != "city" and city:
+        c = city.strip().lower()
+        items = [x for x in items if (x.city or "").strip().lower() == c]
+
+    items.sort(key=lambda x: (x.date or "", x.time or ""))
+    return items
 
 @app.post("/api/events", response_model=EventItem)
 def create_event(payload: EventCreate):
-    conn = get_conn()
-    cur = conn.cursor()
     now = utc_now()
     eid = f"evt_{int(datetime.utcnow().timestamp()*1000)}"
-    band_name = resolve_band_name(conn, payload.band_id)
+    band_name = get_band_name(payload.band_id or "")
 
     lat = lng = None
     g_city = g_state = g_postal = None
@@ -367,32 +410,34 @@ def create_event(payload: EventCreate):
     state = payload.state or g_state
     postal = payload.postal_code or g_postal
 
-    cur.execute(
-        """
-        INSERT INTO events(
-            id, band_id, band_name, event_name, contractor_name, contact,
-            date, time, address, city, state, postal_code, notes, status,
-            lat, lng, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            eid, payload.band_id, band_name, payload.event_name, payload.contractor_name, payload.contact,
-            payload.date, payload.time, payload.address, city, state, postal, payload.notes, payload.status or "planned",
-            lat, lng, now, now
-        ),
-    )
-    conn.commit()
-    row = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
-    conn.close()
-    return EventItem(**row_to_dict(row))
+    data = {
+        "band_id": payload.band_id,
+        "band_name": band_name,
+        "event_name": payload.event_name,
+        "contractor_name": payload.contractor_name,
+        "contact": payload.contact,
+        "date": payload.date,
+        "time": payload.time,
+        "address": payload.address,
+        "city": city,
+        "state": state,
+        "postal_code": postal,
+        "notes": payload.notes,
+        "status": payload.status or "planned",
+        "lat": lat,
+        "lng": lng,
+        "city_lower": (city or "").strip().lower() if city else None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    events_col().document(eid).set(data)
+    return EventItem(id=eid, **row_defaults(data))
 
 @app.delete("/api/events/{event_id}")
 def delete_event(event_id: str):
-    conn = get_conn()
-    conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-    conn.commit()
-    conn.close()
+    events_col().document(event_id).delete()
     return {"ok": True}
+
 
 # -------- Distance / Itinerary --------
 @app.get("/api/distancia", response_model=DistanceResult)
@@ -401,21 +446,19 @@ def distancia(origem: str = Query(...), destino: str = Query(...)):
 
 @app.get("/api/itinerary", response_model=List[ItineraryStep])
 def itinerary(band_id: str = Query(...), date: str = Query(...)):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM events WHERE band_id=? AND date=? ORDER BY time ASC",
-        (band_id, date),
-    ).fetchall()
-    events = [EventItem(**row_to_dict(r)) for r in rows]
-    conn.close()
+    # Query simples por date e filtra band em memória (sem índice composto).
+    docs = list(events_col().where("date", "==", date).stream())
+    items = [EventItem(**event_from_doc(d)) for d in docs]
+    items = [x for x in items if (x.band_id or "") == band_id]
+    items.sort(key=lambda x: (x.time or ""))
 
-    if len(events) < 2:
+    if len(items) < 2:
         return []
 
     steps: List[ItineraryStep] = []
-    for i in range(len(events) - 1):
-        a = events[i]
-        b = events[i + 1]
+    for i in range(len(items) - 1):
+        a = items[i]
+        b = items[i + 1]
         label_a = f"{a.time} • {a.event_name} • {a.address}"
         label_b = f"{b.time} • {b.event_name} • {b.address}"
         dist = None
@@ -434,22 +477,11 @@ def itinerary(band_id: str = Query(...), date: str = Query(...)):
         )
     return steps
 
+
 # -------- Reports (PDF) --------
-def fetch_events_for_report(conn: sqlite3.Connection, band_id: Optional[str], date: Optional[str], city: Optional[str]) -> List[Dict[str, Any]]:
-    q = "SELECT * FROM events WHERE 1=1"
-    params: List[Any] = []
-    if band_id:
-        q += " AND band_id=?"
-        params.append(band_id)
-    if date:
-        q += " AND date=?"
-        params.append(date)
-    if city:
-        q += " AND lower(city)=lower(?)"
-        params.append(city)
-    q += " ORDER BY date ASC, time ASC"
-    rows = conn.execute(q, params).fetchall()
-    return [row_to_dict(r) for r in rows]
+def fetch_events_for_report(band_id: Optional[str], date: Optional[str], city: Optional[str]) -> List[Dict[str, Any]]:
+    items = list_events(date=date, band_id=band_id, city=city)  # type: ignore
+    return [x.model_dump() for x in items]
 
 @app.get("/api/reports/pdf")
 def report_pdf(
@@ -458,9 +490,7 @@ def report_pdf(
     city: Optional[str] = Query(default=None),
     mode: str = Query(default="list", description="list | itinerary"),
 ):
-    conn = get_conn()
-    items = fetch_events_for_report(conn, band_id, date, city)
-    conn.close()
+    items = fetch_events_for_report(band_id, date, city)
 
     itinerary_steps: List[ItineraryStep] = []
     if mode == "itinerary" and band_id and date:
