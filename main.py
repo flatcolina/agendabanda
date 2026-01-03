@@ -21,7 +21,7 @@ except Exception:
     canvas = None  # reportlab optional (for PDF)
 
 APP_NAME = "Hospediou Events + Google Maps"
-DB_PATH = os.getenv("DB_PATH", "app.db")
+DB_PATH = os.getenv("DB_PATH", "/tmp/hospediou_events.db")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 
 _db_lock = threading.Lock()
@@ -91,6 +91,10 @@ def init_db() -> None:
             if not _table_has_column(conn, "events", "band_name"):
                 conn.execute("ALTER TABLE events ADD COLUMN band_name TEXT;")
                 conn.commit()
+
+# Preenche band_name em eventos antigos que ficaram NULL após adicionar a coluna
+conn.execute("UPDATE events SET band_name='Banda' WHERE band_name IS NULL OR TRIM(band_name)='';")
+conn.commit()
         finally:
             conn.close()
 
@@ -129,13 +133,13 @@ class EventBase(BaseModel):
 
     @field_validator("band_id", "band_name", "city", "state", "postal_code", "notes", "status", mode="before")
     @classmethod
-    def _empty_to_none(cls, v):
+    def _empty_to_none(cls, v, info):
         if v is None:
             return None
         if isinstance(v, str):
             v2 = v.strip()
             if v2 == "":
-                return None
+                return "planned" if getattr(info, 'field_name', '') == 'status' else None
             return v2
         return v
 
@@ -173,7 +177,7 @@ class Event(EventBase):
     created_at: str
     updated_at: str
 
-app = FastAPI(title=APP_NAME, version="4.0.0")
+app = FastAPI(title=APP_NAME, version="4.1.1")
 
 def _add_cors_headers(request: Request, response: Response):
     origin = request.headers.get("origin")
@@ -251,7 +255,7 @@ def _startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "version": "3.0.2"}
+    return {"ok": True, "app": APP_NAME, "version": "4.1.1"}
 
 @app.get("/debug/cors")
 def debug_cors(origin: str | None = None):
@@ -266,7 +270,29 @@ def debug_cors(origin: str | None = None):
 # ----------------- Helpers -----------------
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return dict(row)
+    d = dict(row)
+
+    # Normalizações para compatibilidade com DB antigo (evita 500 na serialização)
+    if d.get("status") in (None, ""):
+        d["status"] = "planned"
+
+    # band_name pode vir NULL em DB antigo (coluna adicionada por migration)
+    if d.get("band_name") in (None, ""):
+        d["band_name"] = "Banda"
+
+    # timestamps obrigatórios nos modelos de resposta
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    if d.get("created_at") in (None, ""):
+        d["created_at"] = now
+    if d.get("updated_at") in (None, ""):
+        d["updated_at"] = d.get("created_at") or now
+
+    # strings vazias -> None para campos opcionais
+    for k in ["band_id", "band_name", "city", "state", "postal_code", "notes"]:
+        if k in d and isinstance(d[k], str) and d[k].strip() == "":
+            d[k] = None
+
+    return d
 
 def _require_key():
     if not GOOGLE_MAPS_API_KEY:
