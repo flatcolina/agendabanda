@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import textwrap
 from datetime import datetime
 from io import BytesIO
@@ -43,11 +44,12 @@ def require_maps():
         raise HTTPException(status_code=400, detail="GOOGLE_MAPS_API_KEY não configurada no backend.")
 
 
-def _get_service_account_json() -> str:
+def _get_service_account_json_raw() -> str:
     for k in SERVICE_ACCOUNT_ENV_CANDIDATES:
-        v = os.getenv(k, "").strip()
-        if v:
-            return v
+        v = os.getenv(k, "")
+        if v and v.strip():
+            return v.strip()
+
     # fallback: caminho em arquivo, se preferir usar
     path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if path and os.path.exists(path):
@@ -56,9 +58,65 @@ def _get_service_account_json() -> str:
     return ""
 
 
+def _parse_service_account(raw: str) -> Dict[str, Any]:
+    s = (raw or "").strip()
+    if not s:
+        raise RuntimeError(
+            "Credenciais Firebase não encontradas. Defina a env FIREBASE_SERVICE_ACCOUNT_JSON com o JSON da service account."
+        )
+
+    # Remove aspas externas (alguns painéis salvam como string com aspas)
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # Suporte opcional: base64:....
+    if s.lower().startswith("base64:"):
+        b = s.split(":", 1)[1].strip()
+        try:
+            s = base64.b64decode(b).decode("utf-8").strip()
+        except Exception as e:
+            raise RuntimeError(f"Falha ao decodificar credencial base64: {e}")
+
+    try:
+        data = json.loads(s)
+    except Exception:
+        # Algumas plataformas escapam a string inteira; tenta decodificar escapes
+        try:
+            data = json.loads(s.encode("utf-8").decode("unicode_escape"))
+        except Exception as e:
+            raise RuntimeError(f"JSON inválido em FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
+
+    if not isinstance(data, dict):
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON precisa ser um objeto JSON (dict).")
+
+    # Conserto comum: private_key vem com \n literal — precisamos de newlines reais
+    pk = data.get("private_key")
+    if isinstance(pk, str):
+        pk = pk.replace("\\\\n", "\\n")  # double-escape -> single
+        pk = pk.replace("\\n", "\n")     # literal -> newline real
+        data["private_key"] = pk
+
+    return data
+
+
 def init_firebase() -> firestore.Client:
     if firebase_admin._apps:
         return firestore.client()
+
+    raw = _get_service_account_json_raw()
+    data = _parse_service_account(raw)
+
+    try:
+        cred = credentials.Certificate(data)
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as e:
+        proj = data.get("project_id") if isinstance(data, dict) else None
+        hint = (
+            "Falha ao inicializar Firebase. Verifique se FIREBASE_SERVICE_ACCOUNT_JSON é o JSON de service account "
+            "e se o campo private_key está intacto (com \n)."
+        )
+        raise RuntimeError(f"{hint} project_id={proj} error={e}")
 
     raw = _get_service_account_json()
     if not raw:
@@ -296,6 +354,24 @@ def preflight(full_path: str, request: Request):
 def health():
     _ = db()
     return {"ok": True, "app": APP_NAME, "version": VERSION, "bands_collection": BANDS_COLLECTION, "events_collection": EVENTS_COLLECTION}
+
+
+@app.get("/debug/firebase")
+def debug_firebase():
+    raw = _get_service_account_json_raw()
+    # Não retorna a chave, só metadados úteis
+    try:
+        data = _parse_service_account(raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "ok": True,
+        "project_id": data.get("project_id"),
+        "client_email": data.get("client_email"),
+        "bands_collection": BANDS_COLLECTION,
+        "events_collection": EVENTS_COLLECTION,
+        "has_private_key": bool(data.get("private_key")),
+    }
 
 
 # -------- Helpers (Firestore) --------
