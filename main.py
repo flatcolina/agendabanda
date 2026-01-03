@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, ConfigDict
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
@@ -177,21 +178,23 @@ class BandItem(BaseModel):
 
 
 class EventCreate(BaseModel):
-    band_id: Optional[str] = None
-    event_name: str = Field(..., min_length=2, max_length=120)
-    contractor_name: str = Field(..., min_length=2, max_length=120)
-    contact: str = Field(..., min_length=2, max_length=120)
-    date: str = Field(..., description="YYYY-MM-DD")
-    time: str = Field(..., description="HH:MM")
-    address: str = Field(..., min_length=5, max_length=240)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    city: Optional[str] = Field(default=None, max_length=80)
-    state: Optional[str] = Field(default=None, max_length=80)
-    postal_code: Optional[str] = Field(default=None, max_length=30)
-    notes: Optional[str] = Field(default=None, max_length=2000)
-    status: str = Field(default="planned", max_length=30)
+    band_id: Optional[str] = Field(default=None, validation_alias=AliasChoices("band_id", "band"))
+    event_name: str = Field(..., min_length=2, max_length=120, validation_alias=AliasChoices("event_name", "eventName"))
+    contractor_name: str = Field(..., min_length=2, max_length=120, validation_alias=AliasChoices("contractor_name", "contractorName"))
+    contact: str = Field(..., min_length=2, max_length=120, validation_alias=AliasChoices("contact", "contato"))
+    date: str = Field(..., description="YYYY-MM-DD", validation_alias=AliasChoices("date", "data"))
+    time: str = Field(..., description="HH:MM", validation_alias=AliasChoices("time", "hora"))
+    address: str = Field(..., min_length=5, max_length=240, validation_alias=AliasChoices("address", "endereco"))
 
-    @field_validator(
+    city: Optional[str] = Field(default=None, max_length=80, validation_alias=AliasChoices("city", "cidade"))
+    state: Optional[str] = Field(default=None, max_length=80, validation_alias=AliasChoices("state", "estado"))
+    postal_code: Optional[str] = Field(default=None, max_length=30, validation_alias=AliasChoices("postal_code", "postalCode", "cep"))
+    notes: Optional[str] = Field(default=None, max_length=2000, validation_alias=AliasChoices("notes", "observacoes"))
+    status: str = Field(default="planned", max_length=30, validation_alias=AliasChoices("status", "situacao"))
+
+@field_validator(
         "band_id","event_name","contractor_name","contact","date","time","address",
         "city","state","postal_code","notes","status", mode="before"
     )
@@ -508,6 +511,56 @@ def create_event(payload: EventCreate):
     }
     events_col().document(eid).set(data)
     return EventItem(id=eid, **row_defaults(data))
+
+@app.put("/api/events/{event_id}", response_model=EventItem)
+def update_event(event_id: str, payload: EventCreate):
+    # garante que existe
+    ref = events_col().document(event_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Evento não encontrado.")
+
+    now = utc_now()
+    band_name = get_band_name(payload.band_id or "")
+
+    # tenta geocodificar (se não tiver Maps key, apenas ignora)
+    lat = lng = None
+    g_city = g_state = g_postal = None
+    try:
+        lat, lng, g_city, g_state, g_postal = geocode_address(payload.address)
+    except Exception:
+        pass
+
+    city = payload.city or g_city
+    state = payload.state or g_state
+    postal = payload.postal_code or g_postal
+
+    data = {
+        "band_id": payload.band_id,
+        "band_name": band_name,
+        "event_name": payload.event_name,
+        "contractor_name": payload.contractor_name,
+        "contact": payload.contact,
+        "date": payload.date,
+        "time": payload.time,
+        "address": payload.address,
+        "city": city,
+        "state": state,
+        "postal_code": postal,
+        "notes": payload.notes,
+        "status": payload.status or "planned",
+        "lat": lat,
+        "lng": lng,
+        "city_lower": (city or "").strip().lower() if city else None,
+        "updated_at": now,
+    }
+    ref.set(data, merge=True)
+
+    out = snap.to_dict() or {}
+    out.update(data)
+    out["id"] = event_id
+    out = row_defaults(out)
+    return EventItem(**out)
 
 @app.delete("/api/events/{event_id}")
 def delete_event(event_id: str):
