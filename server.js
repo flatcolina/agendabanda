@@ -19,17 +19,61 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }))
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
+const rawAllowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+
+const normalizeOrigin = (s) => String(s || '').trim().replace(/\/+$/g, '')
+
+const allowedOrigins = rawAllowedOrigins.map(normalizeOrigin)
+
+// Suporta:
+// - lista exata: https://meu-site.netlify.app
+// - wildcard por domínio: *.netlify.app  (ou .netlify.app)
+// - coringa total: *
+const isOriginAllowed = (origin) => {
+  const o = normalizeOrigin(origin)
+  if (!o) return true // server-to-server ou sem Origin
+  if (allowedOrigins.length === 0) return true
+  if (allowedOrigins.includes('*')) return true
+
+  let host = ''
+  try { host = new URL(o).hostname } catch { host = '' }
+
+  for (const entry of allowedOrigins) {
+    if (!entry) continue
+    if (entry.startsWith('*.')) {
+      const suffix = entry.slice(1) // ".netlify.app"
+      if (host && host.endsWith(suffix)) return true
+      continue
+    }
+    if (entry.startsWith('.')) {
+      if (host && host.endsWith(entry)) return true
+      continue
+    }
+    if (o === entry) return true
+  }
+  return false
+}
 
 const corsOptionsDelegate = function (req, callback) {
   const origin = req.header('Origin')
-  if (!origin) return callback(null, { origin: true }) // server-to-server
-  if (allowedOrigins.length === 0) return callback(null, { origin: true })
-  const ok = allowedOrigins.includes(origin)
-  return callback(null, { origin: ok })
+  const ok = isOriginAllowed(origin)
+  // Para CORS: quando ok=false, origin=false => sem header Allow-Origin.
+  // Quando ok=true, devolvemos o origin recebido (mais seguro do que true com credentials).
+  const options = {
+    origin: ok ? (origin ? normalizeOrigin(origin) : true) : false,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    optionsSuccessStatus: 204,
+  }
+  return callback(null, options)
 }
 
 app.use(cors(corsOptionsDelegate))
+app.options('*', cors(corsOptionsDelegate))
+
 
 app.use(rateLimit({
   windowMs: 60 * 1000,
