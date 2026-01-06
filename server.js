@@ -2,7 +2,6 @@ import 'dotenv/config'
 import crypto from 'crypto'
 import express from 'express'
 import helmet from 'helmet'
-import cors from 'cors'
 import rateLimit from 'express-rate-limit'
 import { requireAuth, getFirestore, admin } from './auth.js'
 import { readConsultasFromSheets, readReservasFromSheets } from './sheets.js'
@@ -12,6 +11,8 @@ const app = express()
 // Estamos atrás de proxies (Netlify / Railway). Necessário para express-rate-limit
 // identificar o IP corretamente quando existe X-Forwarded-For.
 app.set('trust proxy', 1)
+
+ 
 
 app.use(express.json({ limit: '1mb' }))
 
@@ -68,31 +69,35 @@ const isOriginAllowed = (origin) => {
   return false
 }
 
-const corsOptionsDelegate = function (req, callback) {
+
+// CORS headers (middleware próprio) para garantir preflight (OPTIONS) sempre OK.
+// Isso evita casos onde o preflight cai em 404/500 sem headers e o navegador bloqueia.
+app.use((req, res, next) => {
   const origin = req.header('Origin')
   const ok = isOriginAllowed(origin)
-  // Para CORS: quando ok=false, origin=false => sem header Allow-Origin.
-  // Quando ok=true:
-  // - se ALLOWED_ORIGINS tiver '*': libera geral (e usa '*' quando NÃO há credentials)
-  // - caso contrário: reflete a Origin recebida.
-  let corsOrigin = false
+
   if (ok) {
-    if (allowedOrigins.includes('*') && !CORS_CREDENTIALS) corsOrigin = '*'
-    else corsOrigin = origin ? normalizeOrigin(origin) : '*'
+    const normalized = origin ? normalizeOrigin(origin) : '*'
+    const allowOrigin = (allowedOrigins.includes('*') && !CORS_CREDENTIALS) ? '*' : (normalized || '*')
+
+    res.setHeader('Access-Control-Allow-Origin', allowOrigin)
+    res.setHeader('Vary', 'Origin')
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
+
+    const reqHeaders = req.header('Access-Control-Request-Headers')
+    res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, Authorization')
+
+    res.setHeader('Access-Control-Max-Age', '600')
+    if (CORS_CREDENTIALS) {
+      res.setHeader('Access-Control-Allow-Credentials', 'true')
+    }
   }
 
-  const options = {
-    origin: corsOrigin,
-    credentials: CORS_CREDENTIALS,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    optionsSuccessStatus: 204,
-    maxAge: 600,
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end()
   }
-  return callback(null, options)
-}
-
-app.use(cors(corsOptionsDelegate))
-app.options('*', cors(corsOptionsDelegate))
+  return next()
+})
 
 
 app.use(rateLimit({
