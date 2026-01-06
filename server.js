@@ -19,14 +19,25 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }))
 
-const rawAllowedOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean)
+// CORS
+// - Por padrão, NÃO usamos cookies/credenciais (mais simples e evita erro com '*').
+// - Se você realmente precisar, setar CORS_CREDENTIALS=true e listar origins exatos em ALLOWED_ORIGINS.
+const CORS_CREDENTIALS = String(process.env.CORS_CREDENTIALS || 'false').toLowerCase() === 'true'
 
-const normalizeOrigin = (s) => String(s || '').trim().replace(/\/+$/g, '')
+const normalizeOrigin = (s) => String(s || '')
+  .trim()
+  .replace(/^['"]+|['"]+$/g, '') // remove aspas acidentais
+  .replace(/\/+$/g, '')
 
-const allowedOrigins = rawAllowedOrigins.map(normalizeOrigin)
+const parseAllowedOrigins = (raw) => {
+  return String(raw || '')
+    .replace(/\r/g, '')
+    .split(/[,;\n]+/g) // aceita vírgula, ponto-e-vírgula e quebra de linha
+    .map(s => normalizeOrigin(s))
+    .filter(Boolean)
+}
+
+const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS)
 
 // Suporta:
 // - lista exata: https://meu-site.netlify.app
@@ -61,12 +72,21 @@ const corsOptionsDelegate = function (req, callback) {
   const origin = req.header('Origin')
   const ok = isOriginAllowed(origin)
   // Para CORS: quando ok=false, origin=false => sem header Allow-Origin.
-  // Quando ok=true, devolvemos o origin recebido (mais seguro do que true com credentials).
+  // Quando ok=true:
+  // - se ALLOWED_ORIGINS tiver '*': libera geral (e usa '*' quando NÃO há credentials)
+  // - caso contrário: reflete a Origin recebida.
+  let corsOrigin = false
+  if (ok) {
+    if (allowedOrigins.includes('*') && !CORS_CREDENTIALS) corsOrigin = '*'
+    else corsOrigin = origin ? normalizeOrigin(origin) : '*'
+  }
+
   const options = {
-    origin: ok ? (origin ? normalizeOrigin(origin) : true) : false,
-    credentials: true,
+    origin: corsOrigin,
+    credentials: CORS_CREDENTIALS,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     optionsSuccessStatus: 204,
+    maxAge: 600,
   }
   return callback(null, options)
 }
