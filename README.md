@@ -1,29 +1,32 @@
-# Railway Backend (FastAPI) — Eventos + Bandas + Google Maps + Relatórios
+# AgendaBandas (Monorepo)
 
-## Variáveis (Railway)
-- `GOOGLE_MAPS_API_KEY` (obrigatório para rotas/distância)
-- (opcional) `FRONTEND_ORIGINS` (para travar CORS)
+Este repositório contém:
+- **Backend (Railway)**: FastAPI simples (rota `/health`) na raiz do projeto.
+- **Frontend (Netlify)**: React + Vite + Tailwind em `frontend/`.
 
-## Endpoints
-### Bandas
-- `GET /api/bands`
-- `POST /api/bands`
-- `DELETE /api/bands/{band_id}`
+> **Versão atual (MVP):** cadastro de **Bandas** e **Agenda de Eventos** (sem Google Maps / logística).
 
-### Eventos
-- `POST /api/events`
-- `GET /api/events`
-- `PUT /api/events/{id}`
-- `DELETE /api/events/{id}`
+## Backend (Railway)
+- O Railway usa o `Dockerfile` da raiz.
+- Variáveis (opcional):
+  - `ALLOWED_ORIGINS` (ex: `https://seusite.netlify.app,http://localhost:5173`)
 
-### Relatórios
-- `GET /api/reports/itinerary?band=...&date=YYYY-MM-DD`
-- `GET /api/reports/pdf?band=&date=&city=`
+Teste:
+- `GET /health` → `{ "ok": true }`
 
-## Observação
-Se você já tinha banco antigo, o backend faz migração leve e mantém os dados.
+## Frontend (Netlify)
+No Netlify:
+- **Base directory:** `frontend`
+- **Build command:** `npm run build`
+- **Publish directory:** `dist`
 
-## CORS (importante)
-- Para travar: defina `FRONTEND_ORIGINS` com seu domínio do Netlify.
-- Ex: `https://whimsical-pixie-4997ea.netlify.app`
-- Ou use regex: `FRONTEND_ORIGIN_REGEX=^https://.*\.netlify\.app$`
+Variáveis no Netlify:
+- `VITE_FIREBASE_API_KEY`
+- `VITE_FIREBASE_AUTH_DOMAIN`
+- `VITE_FIREBASE_PROJECT_ID`
+- `VITE_FIREBASE_STORAGE_BUCKET`
+- `VITE_FIREBASE_MESSAGING_SENDER_ID`
+- `VITE_FIREBASE_APP_ID`
+
+> O frontend acessa o Firestore diretamente via Firebase Web SDK.
+
