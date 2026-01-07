@@ -2,6 +2,7 @@ import 'dotenv/config'
 import crypto from 'crypto'
 import express from 'express'
 import helmet from 'helmet'
+import cors from 'cors'
 import rateLimit from 'express-rate-limit'
 import { requireAuth, getFirestore, admin } from './auth.js'
 import { readConsultasFromSheets, readReservasFromSheets } from './sheets.js'
@@ -12,94 +13,65 @@ const app = express()
 // identificar o IP corretamente quando existe X-Forwarded-For.
 app.set('trust proxy', 1)
 
- 
-
 app.use(express.json({ limit: '1mb' }))
 
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }))
 
-// CORS
-// - Por padrão, NÃO usamos cookies/credenciais (mais simples e evita erro com '*').
-// - Se você realmente precisar, setar CORS_CREDENTIALS=true e listar origins exatos em ALLOWED_ORIGINS.
-const CORS_CREDENTIALS = String(process.env.CORS_CREDENTIALS || 'false').toLowerCase() === 'true'
+const allowedOriginsRaw = String(process.env.ALLOWED_ORIGINS || '').trim()
 
-const normalizeOrigin = (s) => String(s || '')
-  .trim()
-  .replace(/^['"]+|['"]+$/g, '') // remove aspas acidentais
-  .replace(/\/+$/g, '')
-
-const parseAllowedOrigins = (raw) => {
-  return String(raw || '')
-    .replace(/\r/g, '')
-    .split(/[,;\n]+/g) // aceita vírgula, ponto-e-vírgula e quebra de linha
-    .map(s => normalizeOrigin(s))
+function parseAllowedOrigins(raw) {
+  if (!raw) return []
+  // aceita separadores por vírgula, ponto-e-vírgula e quebra de linha
+  return raw
+    .split(/[
+,;]+/g)
+    .map(s => String(s || '').trim())
     .filter(Boolean)
+    .map(s => s.replace(/^['"]|['"]$/g, ''))
 }
 
-const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS)
+const allowedOrigins = parseAllowedOrigins(allowedOriginsRaw)
 
-// Suporta:
-// - lista exata: https://meu-site.netlify.app
-// - wildcard por domínio: *.netlify.app  (ou .netlify.app)
-// - coringa total: *
-const isOriginAllowed = (origin) => {
-  const o = normalizeOrigin(origin)
-  if (!o) return true // server-to-server ou sem Origin
+function originAllowed(origin) {
+  if (!origin) return true
+  // se não configurar nada, libera (evita dor no deploy e permite server-to-server)
   if (allowedOrigins.length === 0) return true
+  // aceita '*' como libera tudo
   if (allowedOrigins.includes('*')) return true
+  if (allowedOrigins.includes(origin)) return true
 
-  let host = ''
-  try { host = new URL(o).hostname } catch { host = '' }
-
-  for (const entry of allowedOrigins) {
-    if (!entry) continue
-    if (entry.startsWith('*.')) {
-      const suffix = entry.slice(1) // ".netlify.app"
-      if (host && host.endsWith(suffix)) return true
-      continue
+  // wildcard simples: entradas como '*.netlify.app' ou '.netlify.app'
+  for (const rule of allowedOrigins) {
+    if (!rule) continue
+    if (rule.startsWith('*.')) {
+      const suffix = rule.slice(1) // '.netlify.app'
+      if (origin.endsWith(suffix)) return true
     }
-    if (entry.startsWith('.')) {
-      if (host && host.endsWith(entry)) return true
-      continue
+    if (rule.startsWith('.')) {
+      if (origin.endsWith(rule)) return true
     }
-    if (o === entry) return true
   }
   return false
 }
 
-
-// CORS headers (middleware próprio) para garantir preflight (OPTIONS) sempre OK.
-// Isso evita casos onde o preflight cai em 404/500 sem headers e o navegador bloqueia.
-app.use((req, res, next) => {
+const corsOptionsDelegate = function (req, callback) {
   const origin = req.header('Origin')
-  const ok = isOriginAllowed(origin)
+  if (!origin) return callback(null, { origin: true }) // server-to-server
 
-  if (ok) {
-    const normalized = origin ? normalizeOrigin(origin) : '*'
-    const allowOrigin = (allowedOrigins.includes('*') && !CORS_CREDENTIALS) ? '*' : (normalized || '*')
+  const ok = originAllowed(origin)
+  return callback(null, {
+    origin: ok,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Telegram-Init-Data'],
+    maxAge: 86400,
+  })
+}
 
-    res.setHeader('Access-Control-Allow-Origin', allowOrigin)
-    res.setHeader('Vary', 'Origin')
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
-
-    const reqHeaders = req.header('Access-Control-Request-Headers')
-    res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, Authorization')
-
-    res.setHeader('Access-Control-Max-Age', '600')
-    if (CORS_CREDENTIALS) {
-      res.setHeader('Access-Control-Allow-Credentials', 'true')
-    }
-  }
-
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end()
-  }
-  return next()
-})
-
-
+// garante preflight sempre tratado
+app.options('*', cors(corsOptionsDelegate))
+app.use(cors(corsOptionsDelegate))
 app.use(rateLimit({
   windowMs: 60 * 1000,
   max: 120,

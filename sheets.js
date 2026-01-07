@@ -130,8 +130,6 @@ function formatTsToISO(ts) {
 
 export async function readReservasFromSheets() {
   const sheetId = process.env.GOOGLE_SHEETS_ID
-  // Default: o usuário organiza as consultas na aba "Agenda_Patusco".
-  // Observação: quem já define GOOGLE_SHEETS_RANGE no Railway continuará prevalecendo.
   const range = process.env.GOOGLE_SHEETS_RANGE || 'Agenda_Patusco!A1:J'
   if (!sheetId) throw new Error('GOOGLE_SHEETS_ID ausente')
 
