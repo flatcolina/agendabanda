@@ -25,8 +25,7 @@ function parseAllowedOrigins(raw) {
   if (!raw) return []
   // aceita separadores por vírgula, ponto-e-vírgula e quebra de linha
   return raw
-    .split(/[
-,;]+/g)
+    .split(/[,\n;\r]+/g)
     .map(s => String(s || '').trim())
     .filter(Boolean)
     .map(s => s.replace(/^['"]|['"]$/g, ''))
